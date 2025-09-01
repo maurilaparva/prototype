@@ -24,10 +24,16 @@ app.register_blueprint(recommend_bp)
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "x-openai-key", "Authorization"],
+    allow_headers=["Content-Type", "x-openai-key", "x-serper-key", "Authorization"],
     methods=["GET", "POST", "OPTIONS"],
 )
-
+@app.after_request
+def add_cors_headers(resp):
+    # Ensure *every* response, including 4xx/5xx, gets CORS
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, x-openai-key, x-serper-key, Authorization'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return resp
 app.secret_key = os.urandom(12)
 
 recommendation_space = {}

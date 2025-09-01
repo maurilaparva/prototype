@@ -115,6 +115,7 @@ export function Chat({ id, initialMessages }: ChatProps) {
   const sentForVerification = useRef<Set<string>>(new Set());
 
   const [previewToken, setPreviewToken] = useLocalStorage<string | null>('ai-token', null);
+  const [serperToken, setSerperToken] = useLocalStorage<string | null>('serper-token', null);
   const [previewTokenDialog, setPreviewTokenDialog] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
@@ -217,10 +218,11 @@ export function Chat({ id, initialMessages }: ChatProps) {
   useEffect(() => {
     if (initialRender.current) {
       const tokenSet = localStorage.getItem('has-token-been-set') === 'true';
-      setPreviewTokenDialog(!tokenSet);
+      // Open the key modal if either key is missing
+      setPreviewTokenDialog(!tokenSet || !previewToken || !serperToken);
       initialRender.current = false;
     }
-  }, []);
+  }, [previewToken, serperToken]);
 
   const seenTriples = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -516,19 +518,53 @@ export function Chat({ id, initialMessages }: ChatProps) {
     });
     if (unseen.length === 0) return;
 
+    // helper to read LS safely whether it was saved JSON.stringified or raw
+    const readLS = (k: string): string | null => {
+      const v = localStorage.getItem(k);
+      if (v == null) return null;
+      try { return JSON.parse(v); } catch { return v; }
+    };
+
     (async () => {
       try {
+        // pull from state OR (fallback) localStorage
+        const openaiKey = previewToken ?? readLS('ai-token');
+        const serperKey = serperToken ?? readLS('serper-token');
+
+        if (!openaiKey || !serperKey) {
+          console.warn('[verify] missing keys — not calling /api/verify', {
+            hasOpenAI: !!openaiKey,
+            hasSerper: !!serperKey,
+          });
+          return;
+        }
+
+        console.log('[verify] sending headers:', {
+          'x-openai-key': (openaiKey as string).slice(0, 8) + '…',
+          'x-serper-key': serperKey ? 'present' : 'missing'
+        });
+
         const res = await fetch(`${API_BASE}/api/verify`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-openai-key': openaiKey as string,
+            'x-serper-key': serperKey as string
+          },
           body: JSON.stringify({ triples: unseen })
         });
-        const { results } = await res.json();
+
+        const data = await res.json();
+        if (!data.results || !Array.isArray(data.results)) {
+          console.error('[verify] request failed:', data);
+          return;
+        }
+
         const buildKey = (h: string, rel: string, t: string) =>
           `${(h || '').toLowerCase()}|${(rel || '').toLowerCase()}|${(t || '').toLowerCase()}`;
 
         const idx = new Map<string, any>();
-        results.forEach((r: any) => {
+        data.results.forEach((r: any) => {
           idx.set(buildKey(r.head, r.relation, r.tail), r);
         });
 
@@ -576,7 +612,8 @@ export function Chat({ id, initialMessages }: ChatProps) {
         console.error('[verify] request failed:', err);
       }
     })();
-  }, [gptTriples, setEdges]); // eslint-disable-line
+
+  }, [gptTriples, setEdges, previewToken, serperToken]); // eslint-disable-line
 
   useEffect(() => {
     const handleResize = () => { updateLayout(); };
@@ -734,7 +771,11 @@ export function Chat({ id, initialMessages }: ChatProps) {
             setPreviewToken(k);
             localStorage.setItem('has-token-been-set', 'true');
           }}
-          initialOpen={!previewToken}
+          setSerperKey={(s: string) => {
+            setSerperToken(s);
+            localStorage.setItem('has-token-been-set', 'true');
+          }}
+          initialOpen={!previewToken || !serperToken}
         />
       )}
 
