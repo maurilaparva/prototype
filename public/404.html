@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Redirecting…</title>
+    <meta http-equiv="refresh" content="0; url=/prototype/" />
+    <script>
+      // SPA fallback: send 404 to index with the same path
+      // See: https://github.com/rafgraph/spa-github-pages
+      (function(l) {
+        var repo = '/prototype'; // <-- your repo name
+        if (l.pathname.startsWith(repo)) return;
+        l.replace(repo + l.pathname + l.search + l.hash);
+      })(location);
+    </script>
+  </head>
+  <body></body>
+</html>
