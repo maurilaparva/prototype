@@ -2,7 +2,7 @@ name: Deploy Vite app to GitHub Pages
 
 on:
   push:
-    branches: [ main ]   # change if your default branch is not 'main'
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -11,31 +11,40 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
-  cancel-in-progress: false
+  group: pages
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 18    # Vite-friendly
-          cache: npm
-
-      # Optional: create .env.production here if you don't want to commit it
-      # - name: Create production env
-      #   run: echo "VITE_API_BASE=https://prototype-l4vl.onrender.com" > .env.production
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml   # <-- key bit
 
       - name: Install deps
-        run: npm ci
+        run: pnpm install --frozen-lockfile=false
 
       - name: Build
-        run: npm run build
+        env:
+          # point frontend to your Render backend
+          VITE_API_BASE: https://prototype-l4vl.onrender.com
+        run: pnpm run build
+
+      # SPA routing fix for GitHub Pages
+      - name: Add 404.html
+        run: cp dist/index.html dist/404.html
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
