@@ -6,9 +6,15 @@ import { IconArrowRight } from './ui/icons.tsx';
 type EmptyScreenProps = Pick<UseChatHelpers, 'setInput' | 'append'> & {
   id: string;
   setApiKey: (key: string) => void;
-  // NEW: set Serper key into app state (e.g., via useLocalStorage in App.tsx)
+
+  /**
+   * Back-compat: we’ll reuse this to store the **Google API key**
+   * (it used to be Serper). App.tsx still persists this into localStorage,
+   * and we’ll refactor the naming in Phase 3.
+   */
   setSerperKey: (key: string) => void;
-  // If true, the modal opens on first render when no key is present
+
+  /** If true, the modal opens on first render when no key is present */
   initialOpen?: boolean;
 };
 
@@ -28,12 +34,16 @@ export function EmptyScreen({
   id,
   append,
   setApiKey,
-  setSerperKey,
+  setSerperKey, // ← reused as Google API key setter (back-compat)
   initialOpen
 }: EmptyScreenProps) {
   const [open, setOpen] = useState<boolean>(!!initialOpen);
-  const [keyInput, setKeyInput] = useState<string>('');
-  const [serperKeyInput, setSerperKeyInput] = useState<string>('');
+
+  // inputs
+  const [openaiKeyInput, setOpenaiKeyInput] = useState<string>('');
+  const [googleKeyInput, setGoogleKeyInput] = useState<string>(''); // was "serper"
+  const [googleCxInput, setGoogleCxInput] = useState<string>('');   // NEW: cx
+
   const [error, setError] = useState<string | null>(null);
 
   // keep the modal in sync if App.tsx toggles initialOpen
@@ -43,27 +53,43 @@ export function EmptyScreen({
 
   const saveKey = () => {
     // Trim + strip accidental surrounding quotes
-    const k = keyInput.trim().replace(/^["']|["']$/g, '');
-    const s = serperKeyInput.trim().replace(/^["']|["']$/g, '');
+    const k = openaiKeyInput.trim().replace(/^["']|["']$/g, '');
+    const g = googleKeyInput.trim().replace(/^["']|["']$/g, '');
+    const cx = googleCxInput.trim().replace(/^["']|["']$/g, '');
 
-    // Light validations
+    // Validations (light)
     if (!k || k.length < 20 || !k.startsWith('sk-')) {
       setError('Please paste a valid OpenAI API key (e.g., starts with "sk-").');
       return;
     }
-
-    // Serper keys can be hex-like or prefixed; keep validation loose
-    if (!s || s.length < 10) {
-      setError('Please paste a valid Serper API key.');
+    if (!g || g.length < 20) {
+      setError('Please paste a valid Google API key (from Google Cloud Console).');
+      return;
+    }
+    if (!cx || cx.length < 8) {
+      setError('Please paste your Search Engine ID (cx).');
       return;
     }
 
     setError(null);
-    setApiKey(k);        // App.tsx will persist via useLocalStorage
-    setSerperKey(s);     // App.tsx will persist via useLocalStorage
+
+    // Persist:
+    // - OpenAI via parent setter (App.tsx already persists locally)
+    // - Google API key via the existing `setSerperKey` (back-compat for Phase 1–2)
+    // - cx directly to localStorage (safe + frontend-only)
+    setApiKey(k);
+    setSerperKey(g);
+    try {
+      localStorage.setItem('google-cx', cx);
+      // Optional: mark that some keys are set so the app doesn’t nag on first load.
+      localStorage.setItem('has-token-been-set', 'true');
+    } catch {}
+
+    // Reset inputs + close
     setOpen(false);
-    setKeyInput('');
-    setSerperKeyInput('');
+    setOpenaiKeyInput('');
+    setGoogleKeyInput('');
+    setGoogleCxInput('');
   };
 
   return (
@@ -105,7 +131,7 @@ export function EmptyScreen({
             Set API keys
           </Button>
           <span className="text-xs text-muted-foreground">
-            Your keys (OpenAI + Serper) are stored locally in your browser.
+            Your keys (OpenAI + Google API key + Search Engine ID) are stored locally in your browser.
           </span>
         </div>
       </div>
@@ -120,29 +146,43 @@ export function EmptyScreen({
           <div className="w-full max-w-md rounded-lg border bg-background p-6 shadow-xl">
             <h2 className="text-base font-semibold mb-2">Enter your API keys</h2>
             <p className="text-sm text-muted-foreground mb-4">
-              Paste your OpenAI and Serper keys below. These will only be stored in your browser
-              and included in each request.
+              Paste your OpenAI key, your Google API key, and your Search Engine ID (cx).
+              These are stored only in your browser and sent with requests from this page.
             </p>
 
+            {/* OpenAI */}
             <label htmlFor="openai-key" className="text-sm font-medium">OpenAI API key</label>
             <input
               id="openai-key"
               type="password"
               placeholder="sk-********************************"
-              value={keyInput}
-              onChange={(e) => setKeyInput(e.target.value)}
+              value={openaiKeyInput}
+              onChange={(e) => setOpenaiKeyInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') saveKey(); }}
               className="w-full rounded-md border px-3 py-2 mb-3 outline-none focus:ring-2 focus:ring-ring"
               autoFocus
             />
 
-            <label htmlFor="serper-key" className="text-sm font-medium">Serper API key</label>
+            {/* Google API key (reuses setSerperKey behind the scenes in Phase 1) */}
+            <label htmlFor="google-key" className="text-sm font-medium">Google API key</label>
             <input
-              id="serper-key"
+              id="google-key"
               type="password"
-              placeholder="your-serper-key"
-              value={serperKeyInput}
-              onChange={(e) => setSerperKeyInput(e.target.value)}
+              placeholder="AIza***********************************"
+              value={googleKeyInput}
+              onChange={(e) => setGoogleKeyInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') saveKey(); }}
+              className="w-full rounded-md border px-3 py-2 mb-3 outline-none focus:ring-2 focus:ring-ring"
+            />
+
+            {/* cx */}
+            <label htmlFor="google-cx" className="text-sm font-medium">Search Engine ID (cx)</label>
+            <input
+              id="google-cx"
+              type="text"
+              placeholder="e.g. 85bd440b6cefc4c80"
+              value={googleCxInput}
+              onChange={(e) => setGoogleCxInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') saveKey(); }}
               className="w-full rounded-md border px-3 py-2 outline-none focus:ring-2 focus:ring-ring"
             />
@@ -157,7 +197,9 @@ export function EmptyScreen({
             </div>
 
             <div className="mt-3 text-xs text-muted-foreground">
-              Don’t have a key? You can create one in your OpenAI and Serper account dashboards.
+              Don’t have keys? Create an OpenAI API key in your OpenAI account, a Google API key in
+              Google Cloud Console (with Custom Search API enabled + HTTP referrer restrictions),
+              and a Search Engine ID in Programmable Search Engine.
             </div>
           </div>
         </div>

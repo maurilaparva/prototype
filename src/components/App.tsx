@@ -1,6 +1,6 @@
 'use Client'
 import { ChatPanel } from './chat-panel.tsx';
-import { useChat } from 'ai/react';
+// import { useChat } from 'ai/react'; // ⛔️ Not used in Phase 2 (we roll our own)
 import { useLocalStorage } from '../lib/hooks/use-local-storage.ts';
 import { toast } from 'react-hot-toast';
 import { type Message } from 'ai/react';
@@ -9,7 +9,7 @@ import { EmptyScreen } from './empty-screen.tsx';
 import { ChatList } from './chat-list.tsx';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { ViewModeProvider } from './ui/view-mode.tsx';
-import { OnEdgesChange, ReactFlowProvider } from 'reactflow';
+import { ReactFlowProvider } from 'reactflow';
 import { ChatScrollAnchor } from './chat-scroll-anchors.tsx';
 import { CustomGraphNode, CustomGraphEdge, BackendData } from '../lib/types.ts';
 import Slider from './chat-slider.tsx';
@@ -24,12 +24,17 @@ import {
 import dagre from 'dagre';
 import { useAtom } from 'jotai';
 import { gptTriplesAtom, recommendationsAtom, backendDataAtom } from '../lib/state.ts';
-import { fetchBackendData, highLevelNodes, colorForCategory, normalizeCategory } from '../lib/utils.tsx';
+import { /* fetchBackendData, */ highLevelNodes, colorForCategory, normalizeCategory } from '../lib/utils.tsx';
 
 import FlowComponent from './vis-flow/index.tsx';
 import { Button } from './ui/button.tsx';
 import { IconRefresh, IconStop } from './ui/icons.tsx';
 import 'reactflow/dist/style.css'
+
+// ---------- Phase switches ----------
+const ENABLE_VERIFY = false;        // Phase 3 will set true
+const ENABLE_RECOMMEND = false;     // Phase 4 will set true
+// -----------------------------------
 
 // Initialize dagre graph for layout calculations
 const dagreGraph = new dagre.graphlib.Graph();
@@ -111,11 +116,12 @@ export function Chat({ id, initialMessages }: ChatProps) {
   const lastEntityCategoriesRef = useRef<Record<string, string>>({});
   const reloadFlag = useRef(false);
   const initialRender = useRef(true);
-  const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:5000';
   const sentForVerification = useRef<Set<string>>(new Set());
+  const aborterRef = useRef<AbortController | null>(null);
 
+  // Keys
   const [previewToken, setPreviewToken] = useLocalStorage<string | null>('ai-token', null);
-  const [serperToken, setSerperToken] = useLocalStorage<string | null>('serper-token', null);
+  const [serperToken, setSerperToken] = useLocalStorage<string | null>('serper-token', null); // Phase 1 used this to store Google key
   const [previewTokenDialog, setPreviewTokenDialog] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
@@ -129,9 +135,15 @@ export function Chat({ id, initialMessages }: ChatProps) {
 
   const [gptTriples, setGptTriples] = useAtom(gptTriplesAtom);
   const gptTriplesRef = useRef(gptTriples);
-  const [backendData, setBackendData] = useAtom(backendDataAtom);
+  const [, setBackendData] = useAtom(backendDataAtom);
   const [isLoadingBackendData, setIsLoadingBackendData] = useState(true);
 
+  // -------- Phase 2: local chat state (replaces useChat) --------
+  const [messages, setMessages] = useState<Message[]>(initialMessages ?? []);
+  const [input, setInput] = useState<string>('');
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+
+  // Parsing patterns
   const entityPattern = /\[([^\]\|]+)(?:\|([^\]]+))?\]\(\$N(\d+)\)/g;
   const relationPattern = /\[([^\]]+)\]\((\$R\d+), (.+?)\)/g;
 
@@ -170,46 +182,175 @@ export function Chat({ id, initialMessages }: ChatProps) {
     return { relations: outputRelations, entityCategories: entityCategoriesByName };
   };
 
-  const { messages, append, reload, stop, isLoading, input, setInput } = useChat({
-    api: `${API_BASE}/api/chat`,
-    initialMessages,
-    id,
-    body: { id },
-    streamProtocol: 'text',
-    headers: { 'x-openai-key': previewToken ?? '' },
-    onResponse(response) {
-      if (response.status === 401) {
-        toast.error(response.statusText);
-        return;
-      }
-      if (reloadFlag.current) {
-        reloadFlag.current = false;
-      } else if (messages.length !== 0) {
-        setActiveStep((activeStep) => activeStep + 1);
-      }
-    },
-    onFinish(message) {
+  // OpenAI chat call (no streaming for Phase 2 — simpler)
+  const callOpenAI = async (allMessages: Message[], apiKey: string) => {
+    const qaPrompt = `
+You are an expert in healthcare and dietary supplements and need to help users answer related questions.
+Please return your response in a format where all entities and their relations are clearly defined in the response.
+Specifically, use [] to identify all entities and relations in the response,
+add () after identified entities and relations to assign unique ids to entities ($N1, $N2, ..) and relations ($R1, $R2, ...).
+When annotating an entity, append its category before the ID, separated by a vertical bar "|". The category must be one of: Dietary Supplement, Drugs, Disease, Symptom, Gene. For example: [Fish Oil|Dietary Supplement]($N1), [Alzheimer's disease|Disease]($N2).
+For the relation, also add the entities it connects to. Use ; to separate if this relation exists in more than one triple.
+The entities can only be the following types: Dietary Supplement, Drugs, Disease, Symptom and Gene.
+Each sentence in the response must include a clearly defined relation between entities, and this relation must be annotated.
+Identified entities must have relations with other entities in the response.
+Each sentence in the response should not include more than one relation.
+When answering a question, focus on identifying and annotating only the entities and relations that are directly relevant to the user's query. Avoid including additional entities that are not closely related to the core question.
+Try to provide context in your response.
+
+After your response, also add the identified entities in the user question, in the format of a JSON string list;
+Please use " || " to split the two parts.
+
+Example 1,
+if the question is "Can Ginkgo biloba prevent Alzheimer's Disease?"
+Your response could be:
+"Gingko biloba is a plant extract...
+Some studies have suggested that [Gingko biloba]($N1) may [improve]($R1, $N1, $N2) cognitive function and behavior in people with [Alzheimer's disease]($N2)... ||
+["Ginkgo biloba", "Alzheimer's Disease"]"
+
+Example 2,
+If the question is "What are the benefits of fish oil?"
+Your response could be:
+"[Fish oil]($N1) is known for its [rich content of]($R1, $N1, $N2) [Omega-3 fatty acids]($N2)... The benefits of [Fish Oil]($N1): [Fish Oil]($N1) can [reduce]($R2, $N1, $N3) the risk of [cognitive decline]($N3).
+[Fight]($R3, $N2, $N4) [Inflammation]($N4): [Omega-3 fatty acids]($N2) has potent... || ["Fish Oil", "Omega-3 fatty acids", "cognitive decline", "Inflammation"]"
+
+Example 3,
+If the question is "Can Coenzyme Q10 prevent Heart disease?"
+Your response could be:
+"Some studies have suggested that [Coenzyme Q10]($N1) supplementation may [have potential benefits]($R1, $N1, $N2) for [heart health]($N2)... [Coenzyme Q10]($N1) [has]($R2, $N1, $N2) [antioxidant properties]($N2)... ||
+["Coenzyme Q10", "heart health", "antioxidant", "Heart disease"]"
+
+Example 4,
+If the question is "Can taking Choerospondias axillaris slow the progression of Alzheimer's disease?"
+Your response could be:
+"
+[Choerospondias axillaris]($N1), also known as Nepali hog plum, is a fruit that is used in traditional medicine in some Asian countries. It is believed to have various health benefits due to its [antioxidant]($N2) properties. However, there is limited scientific research on its effects on [Alzheimer's disease]($N3) specifically.
+
+Some studies have suggested that [antioxidant]($N2) can help [reduce]($R1, $N2, $N3) oxidative stress, which is a factor in the development and progression of [Alzheimer's disease]($N3). Therefore, it is possible that the antioxidant properties of Choerospondias axillaris might have some protective effects against the disease. However, more research is needed to determine its efficacy and the appropriate dosage.  ||
+["Choerospondias axillaris", "antioxidant", "Alzheimer's disease"]"
+
+Example 5,
+If the question is "What Complementary and Integrative Health Interventions are beneficial for people with Alzheimer's disease?"
+Your response could be:
+"Some Complementary and Integrative Health Interventions have been explored for their potential benefits in individuals with [Alzheimer's disease]($N1).
+
+[Mind-body practices]($N2), such as yoga and meditation, are examples of interventions that may [improve]($R1, $N2, $N1) cognitive function and quality of life in people with [Alzheimer's disease]($N1). These practices can help reduce stress and improve emotional well-being.
+
+Dietary supplements, including [omega-3 fatty acids]($N3) and [vitamin E]($N4), have been studied for their potential to [slow]($R2, $N3, $N2; $R3, $N4, $N2) cognitive decline in [Alzheimer's disease]($N2). [Omega-3 fatty acids]($N3) are known for their anti-inflammatory and neuroprotective properties, while [vitamin E]($N4) is an antioxidant that may [protect]($R3, $N4, $N5) [neurons]($N5) from damage.
+
+[Aromatherapy]($N6) using essential oils, such as lavender, has been suggested to [help]($R4, $N6, $N1) with anxiety and improve sleep quality in individuals with [Alzheimer's disease]($N1).
+|| ["Alzheimer's disease", "Mind-body practices", "omega-3 fatty acids", "vitamin E", "Aromatherapy"]"
+
+Use the above examples only as a guide for format and structure. Do not reuse their exact wording. Always generate a unique, original response that follows the annotated format.
+
+
+`;
+
+    const openaiMessages = [
+      { role: 'assistant', content: qaPrompt },
+      ...allMessages.map(m => ({ role: m.role, content: m.content }))
+    ];
+
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: openaiMessages,
+        temperature: 1
+      }),
+      signal: aborterRef.current?.signal
+    });
+
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt || `OpenAI error ${res.status}`);
+    }
+    const data = await res.json();
+    const content = data?.choices?.[0]?.message?.content || '';
+    return content as string;
+  };
+
+  // append() replacement (compatible with ChatPanel)
+  const append = async (msg: Partial<Message> | string) => {
+    const userContent = typeof msg === 'string' ? msg : (msg.content || '');
+    if (!userContent.trim()) return;
+
+    // push user message
+    const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: userContent };
+    setMessages(prev => [...prev, userMsg]);
+    setInput('');
+
+    // guard: require OpenAI key
+    const apiKey = previewToken || (() => {
+      try { return JSON.parse(localStorage.getItem('ai-token') || 'null'); } catch { return localStorage.getItem('ai-token'); }
+    })();
+    if (!apiKey) {
+      toast.error('Missing OpenAI API key');
+      setIsLoading(false);
+      return;
+    }
+
+    // call OpenAI
+    try {
+      setIsLoading(true);
+      aborterRef.current = new AbortController();
+      const assistantContent = await callOpenAI([...messages, userMsg], apiKey as string);
+      const assistantMsg: Message = { id: crypto.randomUUID(), role: 'assistant', content: assistantContent };
+      setMessages(prev => {
+        const updated = [...prev, assistantMsg];
+        // Set activeStep AFTER the state is updated
+        setTimeout(() => {
+          setActiveStep(Math.floor(updated.length / 2) - 1);
+        }, 0);
+        return updated;
+      });
+
+
+      // navigation (kept from original)
       if (!location.pathname.includes('chat')) {
         navigate(`/chat/${id}`, { replace: true });
       }
-      if (message.role === 'assistant' && !processedMessageIds.has(message.id)) {
-        setProcessedMessageIds(new Set([...Array.from(processedMessageIds), message.id]));
-      }
-      const parts = message.content.split('||');
-      const { relations: triples, entityCategories } = extractRelations(parts[0]);
+
+      // extract triples from assistant content
+      const parts = assistantContent.split('||');
+      const { relations: triples, entityCategories } = extractRelations(parts[0] || '');
       setGptTriples(triples);
       lastEntityCategoriesRef.current = entityCategories;
-      if (recommendations.length === 0) {
-        firstConversation(triples);
-      }
-    }
-  });
 
-  const withFetchBackendData = async (payload: any) => {
-    setIsLoadingBackendData(true);
-    const data = await fetchBackendData(payload, API_BASE);
-    return data;
+      // In Phase 2 we skip backend "firstConversation" calls and recommendations
+      // setBackendData(...) not used; leave as-is
+
+      // mimic your active step auto-advance after assistant responds
+      
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        console.warn('[chat] aborted');
+      } else {
+        console.error(err);
+        toast.error('OpenAI request failed. Check your key and network.');
+      }
+    } finally {
+      setIsLoading(false);
+      aborterRef.current = null;
+    }
   };
+
+  const stop = () => {
+    aborterRef.current?.abort();
+  };
+
+  const reload = async () => {
+    // Re-run last user message (if any)
+    const lastUser = [...messages].reverse().find(m => m.role === 'user');
+    if (lastUser) {
+      await append({ role: 'user', content: lastUser.content });
+    }
+  };
+  // ---------------------------------------------------------------
 
   useEffect(() => {
     gptTriplesRef.current = gptTriples;
@@ -229,7 +370,7 @@ export function Chat({ id, initialMessages }: ChatProps) {
     const latestAssistantMsg = [...messages].reverse().find(m => m.role === 'assistant');
     if (!latestAssistantMsg) return;
     const parts = latestAssistantMsg.content.split('||');
-    const { relations: triples, entityCategories } = extractRelations(parts[0]);
+    const { relations: triples, entityCategories } = extractRelations(parts[0] || '');
 
     const newTriples = triples.filter(triple => {
       const key = triple.join('|');
@@ -250,65 +391,9 @@ export function Chat({ id, initialMessages }: ChatProps) {
     data: BackendData["data"],
     currentStep: number
   ) => {
+    // kept for future phases (unused in Phase 2)
     const nodes: CustomGraphNode[] = [];
     const edges: CustomGraphEdge[] = [];
-    const nodeIds = new Set();
-    const edgeIds = new Set();
-
-    if (!data || !data.vis_res) return { nodes, edges };
-
-    data.vis_res.nodes?.forEach(node => {
-      if (!nodeIds.has(node.id)) {
-        const normCat = normalizeCategory(node.name, node.category);
-        const nodeColor = colorForCategory(normCat, node.name);
-        nodes.push({
-          id: node.id,
-          data: {
-            label: node.name,
-            kgName: node.name,
-            gptName: data.node_name_mapping?.[node.name],
-            recommendations: data.recommendation,
-            bgColor: nodeColor
-          },
-          position: { x: 0, y: 0 },
-          type: 'custom',
-          category: normCat,
-          style: { opacity: 1, background: nodeColor, borderRadius: '5px' },
-          step: currentStep
-        });
-        nodeIds.add(node.id);
-      }
-    });
-
-    data.vis_res.edges?.forEach((edge: any) => {
-      const edgeId = `e${edge.source}-${edge.target}`;
-      const edgeRevId = `e${edge.target}-${edge.source}`;
-      if (!edgeIds.has(edgeId) && !edgeIds.has(edgeRevId)) {
-        edges.push({
-          id: edgeId,
-          source: edge.source,
-          target: edge.target,
-          label: edge.category,
-          data: {
-            papers: { [edge.category]: [edge.PubMed_ID] },
-            sourceName: data.vis_res.nodes.find((n: any) => n.id === edge.source)?.name,
-            targetName: data.vis_res.nodes.find((n: any) => n.id === edge.target)?.name
-          },
-          type: 'custom',
-          step: currentStep,
-          style: { opacity: 1 }
-        });
-        edgeIds.add(edgeId);
-      } else {
-        const existEdge = edges.find(e => e.id === edgeId);
-        if (existEdge!['data']['papers'][edge.category]) {
-          existEdge!['data']['papers'][edge.category].push(edge.PubMed_ID);
-        } else {
-          existEdge!['data']['papers'][edge.category] = [edge.PubMed_ID];
-        }
-      }
-    });
-
     setIsLoadingBackendData(false);
     return { nodes, edges };
   };
@@ -471,156 +556,28 @@ export function Chat({ id, initialMessages }: ChatProps) {
     [setNodes, setEdges]
   );
 
-  const continueConversation = async (recommendId: number, triples: string[][]) => {
-    const payload = {
-      input_type: 'continue_conversation',
-      userId: id,
-      data: { recommendId, triples }
-    };
-    const data = await withFetchBackendData(payload);
-    if (data) setBackendData(data);
-  };
-
-  const handleStepChange = useCallback((step: number) => {
-    setActiveStep(step);
-  }, []);
-
-  const proOptions = { hideAttribution: true };
-  const onInit = setReactFlowInstance;
-  const onConnect: OnConnect = useCallback(
-    params => setEdges(eds => addEdge(params, eds)),
-    [setEdges]
-  );
-
-  const firstConversation = async (triples: string[][]) => {
-    const payload = {
-      input_type: 'new_conversation',
-      userId: id,
-      data: { triples }
-    };
-    const data = await withFetchBackendData(payload);
-    if (data) setBackendData(data);
-  };
-
+  // Phase 2: when gptTriples updates, draw them
   useEffect(() => {
     if (gptTriples) {
       appendDataToFlow1(gptTriples, activeStep, lastEntityCategoriesRef.current);
     }
   }, [gptTriples, appendDataToFlow1, activeStep]);
 
+  // Phase 2: disable verification (Phase 3 will re-enable)
   useEffect(() => {
-    const unseen = (gptTriples ?? []).filter(triple => {
-      const key = triple.join('|');
-      if (!sentForVerification.current) return false;
-      if (sentForVerification.current.has(key)) return false;
-      sentForVerification.current.add(key);
-      return true;
-    });
-    if (unseen.length === 0) return;
-
-    // helper to read LS safely whether it was saved JSON.stringified or raw
-    const readLS = (k: string): string | null => {
-      const v = localStorage.getItem(k);
-      if (v == null) return null;
-      try { return JSON.parse(v); } catch { return v; }
-    };
-
-    (async () => {
-      try {
-        // pull from state OR (fallback) localStorage
-        const openaiKey = previewToken ?? readLS('ai-token');
-        const serperKey = serperToken ?? readLS('serper-token');
-
-        if (!openaiKey || !serperKey) {
-          console.warn('[verify] missing keys — not calling /api/verify', {
-            hasOpenAI: !!openaiKey,
-            hasSerper: !!serperKey,
-          });
-          return;
-        }
-
-        console.log('[verify] sending headers:', {
-          'x-openai-key': (openaiKey as string).slice(0, 8) + '…',
-          'x-serper-key': serperKey ? 'present' : 'missing'
-        });
-
-        const res = await fetch(`${API_BASE}/api/verify`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-openai-key': openaiKey as string,
-            'x-serper-key': serperKey as string
-          },
-          body: JSON.stringify({ triples: unseen })
-        });
-
-        const data = await res.json();
-        if (!data.results || !Array.isArray(data.results)) {
-          console.error('[verify] request failed:', data);
-          return;
-        }
-
-        const buildKey = (h: string, rel: string, t: string) =>
-          `${(h || '').toLowerCase()}|${(rel || '').toLowerCase()}|${(t || '').toLowerCase()}`;
-
-        const idx = new Map<string, any>();
-        data.results.forEach((r: any) => {
-          idx.set(buildKey(r.head, r.relation, r.tail), r);
-        });
-
-        const DRAW_MS = 400;
-        setTimeout(() => {
-          setEdges(prev =>
-            prev.map(e => {
-              const head = e.source.replace(/^node-/, '');
-              const tail = e.target.replace(/^node-/, '');
-              const baseRel = (e.data && (e.data as any).relation) ? (e.data as any).relation : (e.label as string);
-              const vr = idx.get(buildKey(head, baseRel, tail));
-              if (!vr) return e;
-
-              const style = { ...e.style, strokeLinecap: 'butt' as const };
-              if (vr.ui_hint === 'weak') {
-                style.strokeDasharray = '6 4';
-                style.strokeWidth = 2;
-              } else if (vr.ui_hint === 'missing') {
-                style.strokeDasharray = '2 4';
-                style.strokeWidth = 2;
-              } else {
-                style.strokeDasharray = undefined;
-                style.strokeWidth = 2.5;
-              }
-
-              const count = typeof vr.count === 'number' ? vr.count : 0;
-              const papers: string[] = Array.isArray(vr.papers) ? vr.papers : [];
-
-              return {
-                ...e,
-                label: `${baseRel} | ${count}`,
-                data: {
-                  ...(e.data || {}),
-                  relation: baseRel,
-                  verification: vr,
-                  papers: { [baseRel]: papers },
-                  papersList: papers
-                },
-                style
-              };
-            })
-          );
-        }, DRAW_MS);
-      } catch (err) {
-        console.error('[verify] request failed:', err);
-      }
-    })();
-
-  }, [gptTriples, setEdges, previewToken, serperToken]); // eslint-disable-line
+    if (!ENABLE_VERIFY) return;
+    // (no-op)
+  }, [gptTriples]);
 
   useEffect(() => {
     const handleResize = () => { updateLayout(); };
     window.addEventListener('resize', handleResize);
     return () => { window.removeEventListener('resize', handleResize); };
   }, [updateLayout]);
-
+  // top-level, NOT inside JSX
+  const handleConnect = useCallback((params: any) => {
+    setEdges((eds) => addEdge(params, eds));
+  }, [setEdges]);
   // ========= NEW: recs for clicked node =========
   type Suggestion = {
     text: string;
@@ -635,39 +592,10 @@ export function Chat({ id, initialMessages }: ChatProps) {
   const [activeNodeRecs, setActiveNodeRecs] = useState<Suggestion[]>([]);
 
   useEffect(() => {
-    if (!clickedNode) {
-      setActiveNodeRecs([]);
-      return;
-    }
-    const headName =
-      clickedNode?.data?.label ||
-      String(clickedNode?.id || '').replace(/^node-/, '');
-
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/recommend`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            head: headName,
-            k: 5,
-            whitelist: [
-              "AFFECTS","BENEFITS","INTERACTS","PROTECTS",
-              "REDUCES","MODULATES","ASSOCIATED_WITH"
-            ],
-            direction: "any",
-            per_type_cap: 2,
-            exclude: []
-          })
-        });
-        const json = await res.json();
-        setActiveNodeRecs(Array.isArray(json?.suggestions) ? json.suggestions : []);
-      } catch (e) {
-        console.error('[recommend] failed', e);
-        setActiveNodeRecs([]);
-      }
-    })();
-  }, [clickedNode, API_BASE]);
+    if (!ENABLE_RECOMMEND) { setActiveNodeRecs([]); return; }
+    if (!clickedNode) { setActiveNodeRecs([]); return; }
+    // Phase 4 we’ll implement frontend recommendations here.
+  }, [clickedNode]);
 
   // ========= UI =========
   const StopRegenerateButton = isLoading ? (
@@ -709,7 +637,7 @@ export function Chat({ id, initialMessages }: ChatProps) {
     <div className="max-w-[100vw] rounded-lg border bg-background p-4">
       {messages.length ? (
         <>
-          {/* GRID: [chat | graph] (sidebar removed) */}
+          {/* GRID: [chat | graph] */}
           <div className="pt-4 md:pt-10 md:grid md:grid-cols-[2fr_3fr] gap-4">
             {/* LEFT: chat list */}
             <div className="overflow-auto min-w-0">
@@ -734,9 +662,9 @@ export function Chat({ id, initialMessages }: ChatProps) {
                   edges={edges}
                   onNodesChange={onNodesChange}
                   onEdgesChange={onEdgesChange}
-                  proOptions={proOptions}
-                  onConnect={onConnect}
-                  onInit={onInit}
+                  proOptions={{ hideAttribution: true }}
+                  onConnect={handleConnect}
+                  onInit={setReactFlowInstance}
                   setClickedNode={setClickedNode}
                   updateLayout={updateLayout}
                   setLayoutDirection={setLayoutDirection}
@@ -753,11 +681,11 @@ export function Chat({ id, initialMessages }: ChatProps) {
           <div className="flex justify-center items-center pt-3">
             <Slider
               messages={messages}
-              steps={messages.length / 2}
+              steps={Math.floor(messages.length / 2)}
               activeStep={activeStep}
-              handleNext={() => handleStepChange(Math.min(activeStep + 1, nodes.length - 1))}
-              handleBack={() => handleStepChange(Math.max(activeStep - 1, 0))}
-              jumpToStep={handleStepChange}
+              handleNext={() => setActiveStep(Math.min(activeStep + 1, nodes.length - 1))}
+              handleBack={() => setActiveStep(Math.max(activeStep - 1, 0))}
+              jumpToStep={setActiveStep}
             />
             {circleProgress}
           </div>
@@ -772,14 +700,14 @@ export function Chat({ id, initialMessages }: ChatProps) {
             localStorage.setItem('has-token-been-set', 'true');
           }}
           setSerperKey={(s: string) => {
-            setSerperToken(s);
+            setSerperToken(s); // Phase 1 stored Google key here
             localStorage.setItem('has-token-been-set', 'true');
           }}
           initialOpen={!previewToken || !serperToken}
         />
       )}
 
-      {/* Bottom Chat Panel now also receives recs + clicked label */}
+      {/* Bottom Chat Panel */}
       <ChatPanel
         id={id}
         isLoading={isLoading}
@@ -789,7 +717,7 @@ export function Chat({ id, initialMessages }: ChatProps) {
         messages={messages}
         input={input}
         setInput={setInput}
-        recommendations={activeNodeRecs}
+        recommendations={[]}
         clickedLabel={
           clickedNode?.data?.label ||
           String(clickedNode?.id || '').replace(/^node-/, '') ||
