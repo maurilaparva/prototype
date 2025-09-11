@@ -18,7 +18,6 @@ import {
   Position,
   ReactFlowInstance,
   useEdgesState,
-  OnConnect,
   addEdge
 } from 'reactflow';
 import dagre from 'dagre';
@@ -182,8 +181,13 @@ export function Chat({ id, initialMessages }: ChatProps) {
     return { relations: outputRelations, entityCategories: entityCategoriesByName };
   };
 
-  // OpenAI chat call (no streaming for Phase 2 — simpler)
-  const callOpenAI = async (allMessages: Message[], apiKey: string) => {
+  // ===== Streaming OpenAI call =====
+  const callOpenAIStream = async (
+    allMessages: Message[],
+    apiKey: string,
+    onFirstToken: () => void,
+    onDelta: (deltaText: string) => void
+  ) => {
     const qaPrompt = `
 You are an expert in healthcare and dietary supplements and need to help users answer related questions.
 Please return your response in a format where all entities and their relations are clearly defined in the response.
@@ -243,7 +247,6 @@ Dietary supplements, including [omega-3 fatty acids]($N3) and [vitamin E]($N4), 
 
 Use the above examples only as a guide for format and structure. Do not reuse their exact wording. Always generate a unique, original response that follows the annotated format.
 
-
 `;
 
     const openaiMessages = [
@@ -260,21 +263,48 @@ Use the above examples only as a guide for format and structure. Do not reuse th
       body: JSON.stringify({
         model: 'gpt-4o',
         messages: openaiMessages,
-        temperature: 1
+        temperature: 1,
+        stream: true
       }),
       signal: aborterRef.current?.signal
     });
 
-    if (!res.ok) {
-      const txt = await res.text();
+    if (!res.ok || !res.body) {
+      const txt = await res.text().catch(()=>'');
       throw new Error(txt || `OpenAI error ${res.status}`);
     }
-    const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content || '';
-    return content as string;
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let first = true;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+
+      for (const line of chunk.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === '[DONE]') continue;
+
+        try {
+          const json = JSON.parse(dataStr);
+          const delta = json?.choices?.[0]?.delta?.content ?? '';
+          if (delta) {
+            if (first) { onFirstToken(); first = false; }
+            onDelta(delta);
+          }
+        } catch {
+          // ignore partial JSON
+        }
+      }
+    }
   };
 
-  // append() replacement (compatible with ChatPanel)
+  // append() replacement with streaming
   const append = async (msg: Partial<Message> | string) => {
     const userContent = typeof msg === 'string' ? msg : (msg.content || '');
     if (!userContent.trim()) return;
@@ -290,42 +320,44 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     })();
     if (!apiKey) {
       toast.error('Missing OpenAI API key');
-      setIsLoading(false);
       return;
     }
 
-    // call OpenAI
+    // create empty assistant placeholder to stream into
+    const assistantMsgId = crypto.randomUUID();
+    setMessages(prev => [...prev, { id: assistantMsgId, role: 'assistant', content: '' }]);
+
     try {
       setIsLoading(true);
       aborterRef.current = new AbortController();
-      const assistantContent = await callOpenAI([...messages, userMsg], apiKey as string);
-      const assistantMsg: Message = { id: crypto.randomUUID(), role: 'assistant', content: assistantContent };
-      setMessages(prev => {
-        const updated = [...prev, assistantMsg];
-        // Set activeStep AFTER the state is updated
-        setTimeout(() => {
-          setActiveStep(Math.floor(updated.length / 2) - 1);
-        }, 0);
-        return updated;
-      });
+      let buffered = '';
 
+      await callOpenAIStream(
+        [...messages, userMsg],
+        apiKey as string,
+        // onFirstToken
+        () => {
+          // mirror old onResponse: bump activeStep and ensure we're on the chat route
+          setActiveStep(curr => curr + 1);
+          if (!location.pathname.includes('chat')) {
+            navigate(`/chat/${id}`, { replace: true });
+          }
+        },
+        // onDelta
+        (delta) => {
+          buffered += delta;
+          setMessages(prev =>
+            prev.map(m => m.id === assistantMsgId ? { ...m, content: (m.content || '') + delta } : m)
+          );
+        }
+      );
 
-      // navigation (kept from original)
-      if (!location.pathname.includes('chat')) {
-        navigate(`/chat/${id}`, { replace: true });
-      }
-
-      // extract triples from assistant content
-      const parts = assistantContent.split('||');
+      // After stream completes, do one final parse to ensure we captured all triples
+      const parts = (buffered || '').split('||');
       const { relations: triples, entityCategories } = extractRelations(parts[0] || '');
-      setGptTriples(triples);
+      if (triples?.length) setGptTriples(triples);
       lastEntityCategoriesRef.current = entityCategories;
 
-      // In Phase 2 we skip backend "firstConversation" calls and recommendations
-      // setBackendData(...) not used; leave as-is
-
-      // mimic your active step auto-advance after assistant responds
-      
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         console.warn('[chat] aborted');
@@ -574,11 +606,12 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     window.addEventListener('resize', handleResize);
     return () => { window.removeEventListener('resize', handleResize); };
   }, [updateLayout]);
-  // top-level, NOT inside JSX
+
   const handleConnect = useCallback((params: any) => {
     setEdges((eds) => addEdge(params, eds));
   }, [setEdges]);
-  // ========= NEW: recs for clicked node =========
+
+  // ========= NEW: recs for clicked node (disabled this phase) =========
   type Suggestion = {
     text: string;
     head: { id: string; name: string; types: string[] };
@@ -616,9 +649,9 @@ Use the above examples only as a guide for format and structure. Do not reuse th
   );
 
   const r = 18,
-    c = Math.PI * (r * 2),
-    val = (recommendations.length - 1) / recommendationMaxLen.current,
-    pct = val * c;
+        c = Math.PI * (r * 2),
+        val = (recommendations.length - 1) / recommendationMaxLen.current,
+        pct = val * c;
 
   const circleProgress =
     recommendationMaxLen.current > 0 && recommendations.length >= 0 ? (
@@ -650,7 +683,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
                   clickedNode={clickedNode}
                 />
               </ViewModeProvider>
-              {activeStep == messages.length / 2 - 1 && StopRegenerateButton}
+              {activeStep == Math.floor(messages.length / 2) - 1 && StopRegenerateButton}
               <ChatScrollAnchor trackVisibility={isLoading} />
             </div>
 
