@@ -1,6 +1,6 @@
 'use Client'
 import { ChatPanel } from './chat-panel.tsx';
-// import { useChat } from 'ai/react'; // ⛔️ Not used in Phase 2 (we roll our own)
+// import { useChat } from 'ai/react';
 import { useLocalStorage } from '../lib/hooks/use-local-storage.ts';
 import { toast } from 'react-hot-toast';
 import { type Message } from 'ai/react';
@@ -31,11 +31,10 @@ import { IconRefresh, IconStop } from './ui/icons.tsx';
 import 'reactflow/dist/style.css'
 
 // ---------- Phase switches ----------
-const ENABLE_VERIFY = false;        // Phase 3 will set true
-const ENABLE_RECOMMEND = false;     // Phase 4 will set true
+const ENABLE_VERIFY = false;
+const ENABLE_RECOMMEND = false;
 // -----------------------------------
 
-// Initialize dagre graph for layout calculations
 const dagreGraph = new dagre.graphlib.Graph();
 dagreGraph.setDefaultEdgeLabel(() => ({}));
 const nodeWidth = 172;
@@ -111,6 +110,9 @@ export interface ChatProps extends React.ComponentProps<'div'> {
   id?: string;
 }
 
+// tiny helper to timestamp without changing the imported type
+type Msg = Message & { createdAt?: string };
+
 export function Chat({ id, initialMessages }: ChatProps) {
   const lastEntityCategoriesRef = useRef<Record<string, string>>({});
   const reloadFlag = useRef(false);
@@ -118,14 +120,12 @@ export function Chat({ id, initialMessages }: ChatProps) {
   const sentForVerification = useRef<Set<string>>(new Set());
   const aborterRef = useRef<AbortController | null>(null);
 
-  // Keys
   const [previewToken, setPreviewToken] = useLocalStorage<string | null>('ai-token', null);
-  const [serperToken, setSerperToken] = useLocalStorage<string | null>('serper-token', null); // Phase 1 used this to store Google key
+  const [serperToken, setSerperToken] = useLocalStorage<string | null>('serper-token', null);
   const [previewTokenDialog, setPreviewTokenDialog] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
 
-  // (existing atoms / state)
   const [recommendations] = useAtom(recommendationsAtom);
   const recommendationMaxLen = useRef(0);
 
@@ -137,13 +137,12 @@ export function Chat({ id, initialMessages }: ChatProps) {
   const [, setBackendData] = useAtom(backendDataAtom);
   const [isLoadingBackendData, setIsLoadingBackendData] = useState(true);
 
-  // -------- Phase 2: local chat state (replaces useChat) --------
-  const [messages, setMessages] = useState<Message[]>(initialMessages ?? []);
+  const [messages, setMessages] = useState<Msg[]>(initialMessages as Msg[] ?? []);
   const [input, setInput] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
 
-  // Parsing patterns
   const entityPattern = /\[([^\]\|]+)(?:\|([^\]]+))?\]\(\$N(\d+)\)/g;
+  // ✅ Fixed: removed the extra `)` before the final `\)`
   const relationPattern = /\[([^\]]+)\]\((\$R\d+), (.+?)\)/g;
 
   const extractRelations = (text: string): {
@@ -246,7 +245,6 @@ Dietary supplements, including [omega-3 fatty acids]($N3) and [vitamin E]($N4), 
 || ["Alzheimer's disease", "Mind-body practices", "omega-3 fatty acids", "vitamin E", "Aromatherapy"]"
 
 Use the above examples only as a guide for format and structure. Do not reuse their exact wording. Always generate a unique, original response that follows the annotated format.
-
 `;
 
     const openaiMessages = [
@@ -298,23 +296,28 @@ Use the above examples only as a guide for format and structure. Do not reuse th
             onDelta(delta);
           }
         } catch {
-          // ignore partial JSON
+          // ignore partial JSON frames
         }
       }
     }
   };
 
-  // append() replacement with streaming
+  // ===== append() with streaming =====
   const append = async (msg: Partial<Message> | string) => {
     const userContent = typeof msg === 'string' ? msg : (msg.content || '');
     if (!userContent.trim()) return;
 
-    // push user message
-    const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: userContent };
+    // push user message (with createdAt)
+    const userMsg: Msg = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: userContent,
+      createdAt: new Date().toISOString()
+    };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
 
-    // guard: require OpenAI key
+    // key
     const apiKey = previewToken || (() => {
       try { return JSON.parse(localStorage.getItem('ai-token') || 'null'); } catch { return localStorage.getItem('ai-token'); }
     })();
@@ -323,9 +326,18 @@ Use the above examples only as a guide for format and structure. Do not reuse th
       return;
     }
 
-    // create empty assistant placeholder to stream into
+    // assistant placeholder (with createdAt)
     const assistantMsgId = crypto.randomUUID();
-    setMessages(prev => [...prev, { id: assistantMsgId, role: 'assistant', content: '' }]);
+    const assistantPlaceholder: Msg = {
+      id: assistantMsgId,
+      role: 'assistant',
+      content: '',
+      createdAt: new Date().toISOString()
+    };
+    setMessages(prev => [...prev, assistantPlaceholder]);
+
+    // compute the current pair index (0-based)
+    const pairIndex = Math.floor(([...messages, userMsg, assistantPlaceholder].length) / 2) - 1;
 
     try {
       setIsLoading(true);
@@ -335,10 +347,9 @@ Use the above examples only as a guide for format and structure. Do not reuse th
       await callOpenAIStream(
         [...messages, userMsg],
         apiKey as string,
-        // onFirstToken
+        // onFirstToken — set to the computed pair index (do NOT +1)
         () => {
-          // mirror old onResponse: bump activeStep and ensure we're on the chat route
-          setActiveStep(curr => curr + 1);
+          setActiveStep(pairIndex);
           if (!location.pathname.includes('chat')) {
             navigate(`/chat/${id}`, { replace: true });
           }
@@ -346,13 +357,18 @@ Use the above examples only as a guide for format and structure. Do not reuse th
         // onDelta
         (delta) => {
           buffered += delta;
+          // replace assistant msg immutably so memoized children update
           setMessages(prev =>
-            prev.map(m => m.id === assistantMsgId ? { ...m, content: (m.content || '') + delta } : m)
+            prev.map(m =>
+              m.id === assistantMsgId
+                ? { ...m, content: (m.content || '') + delta }
+                : m
+            )
           );
         }
       );
 
-      // After stream completes, do one final parse to ensure we captured all triples
+      // final parse
       const parts = (buffered || '').split('||');
       const { relations: triples, entityCategories } = extractRelations(parts[0] || '');
       if (triples?.length) setGptTriples(triples);
@@ -376,13 +392,11 @@ Use the above examples only as a guide for format and structure. Do not reuse th
   };
 
   const reload = async () => {
-    // Re-run last user message (if any)
     const lastUser = [...messages].reverse().find(m => m.role === 'user');
     if (lastUser) {
       await append({ role: 'user', content: lastUser.content });
     }
   };
-  // ---------------------------------------------------------------
 
   useEffect(() => {
     gptTriplesRef.current = gptTriples;
@@ -391,7 +405,6 @@ Use the above examples only as a guide for format and structure. Do not reuse th
   useEffect(() => {
     if (initialRender.current) {
       const tokenSet = localStorage.getItem('has-token-been-set') === 'true';
-      // Open the key modal if either key is missing
       setPreviewTokenDialog(!tokenSet || !previewToken || !serperToken);
       initialRender.current = false;
     }
@@ -401,7 +414,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
   useEffect(() => {
     const latestAssistantMsg = [...messages].reverse().find(m => m.role === 'assistant');
     if (!latestAssistantMsg) return;
-    const parts = latestAssistantMsg.content.split('||');
+    const parts = (latestAssistantMsg.content || '').split('||');
     const { relations: triples, entityCategories } = extractRelations(parts[0] || '');
 
     const newTriples = triples.filter(triple => {
@@ -423,7 +436,6 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     data: BackendData["data"],
     currentStep: number
   ) => {
-    // kept for future phases (unused in Phase 2)
     const nodes: CustomGraphNode[] = [];
     const edges: CustomGraphEdge[] = [];
     setIsLoadingBackendData(false);
@@ -501,7 +513,6 @@ Use the above examples only as a guide for format and structure. Do not reuse th
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [layoutDirection, setLayoutDirection] = useState('TB');
   const [activeStep, setActiveStep] = useState(0);
-  const [processedMessageIds, setProcessedMessageIds] = useState(new Set());
 
   const updateLayout = useCallback(
     (direction = layoutDirection) => {
@@ -588,17 +599,14 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     [setNodes, setEdges]
   );
 
-  // Phase 2: when gptTriples updates, draw them
   useEffect(() => {
     if (gptTriples) {
       appendDataToFlow1(gptTriples, activeStep, lastEntityCategoriesRef.current);
     }
   }, [gptTriples, appendDataToFlow1, activeStep]);
 
-  // Phase 2: disable verification (Phase 3 will re-enable)
   useEffect(() => {
     if (!ENABLE_VERIFY) return;
-    // (no-op)
   }, [gptTriples]);
 
   useEffect(() => {
@@ -611,26 +619,19 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     setEdges((eds) => addEdge(params, eds));
   }, [setEdges]);
 
-  // ========= NEW: recs for clicked node (disabled this phase) =========
-  type Suggestion = {
-    text: string;
-    head: { id: string; name: string; types: string[] };
-    relation: { type: string; direction: string };
-    tail: { id: string; name: string; types: string[] };
-    count: number;
-    source: string;
-  };
+  // clamp activeStep so chat never vanishes if something drifts
+  useEffect(() => {
+    setActiveStep(s => Math.min(s, Math.max(0, Math.floor(messages.length / 2) - 1)));
+  }, [messages.length]);
 
   const [clickedNode, setClickedNode] = useState<any>(null);
-  const [activeNodeRecs, setActiveNodeRecs] = useState<Suggestion[]>([]);
+  const [activeNodeRecs, setActiveNodeRecs] = useState<any[]>([]);
 
   useEffect(() => {
     if (!ENABLE_RECOMMEND) { setActiveNodeRecs([]); return; }
     if (!clickedNode) { setActiveNodeRecs([]); return; }
-    // Phase 4 we’ll implement frontend recommendations here.
   }, [clickedNode]);
 
-  // ========= UI =========
   const StopRegenerateButton = isLoading ? (
     <Button variant="outline" onClick={() => stop()} className="relative left-[60%]">
       <IconStop className="mr-2" /> Stop
@@ -676,14 +677,15 @@ Use the above examples only as a guide for format and structure. Do not reuse th
             <div className="overflow-auto min-w-0">
               <ViewModeProvider>
                 <ChatList
-                  messages={messages}
+                  key={messages.map(m => m.id).join('|')}  // force rerender on stream
+                  messages={messages as Message[]}
                   activeStep={activeStep}
                   nodes={nodes}
                   edges={edges}
                   clickedNode={clickedNode}
                 />
               </ViewModeProvider>
-              {activeStep == Math.floor(messages.length / 2) - 1 && StopRegenerateButton}
+              {activeStep === Math.floor(messages.length / 2) - 1 && StopRegenerateButton}
               <ChatScrollAnchor trackVisibility={isLoading} />
             </div>
 
@@ -713,7 +715,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
 
           <div className="flex justify-center items-center pt-3">
             <Slider
-              messages={messages}
+              messages={messages as Message[]}
               steps={Math.floor(messages.length / 2)}
               activeStep={activeStep}
               handleNext={() => setActiveStep(Math.min(activeStep + 1, nodes.length - 1))}
@@ -733,7 +735,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
             localStorage.setItem('has-token-been-set', 'true');
           }}
           setSerperKey={(s: string) => {
-            setSerperToken(s); // Phase 1 stored Google key here
+            setSerperToken(s);
             localStorage.setItem('has-token-been-set', 'true');
           }}
           initialOpen={!previewToken || !serperToken}
@@ -747,7 +749,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
         stop={stop}
         append={append}
         reload={reload}
-        messages={messages}
+        messages={messages as Message[]}
         input={input}
         setInput={setInput}
         recommendations={[]}
