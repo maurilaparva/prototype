@@ -31,7 +31,7 @@ import { IconRefresh, IconStop } from './ui/icons.tsx';
 import 'reactflow/dist/style.css'
 
 // ---------- Phase switches ----------
-const ENABLE_VERIFY = false;
+const ENABLE_VERIFY = true;
 const ENABLE_RECOMMEND = false;
 // -----------------------------------
 
@@ -112,6 +112,49 @@ export interface ChatProps extends React.ComponentProps<'div'> {
 
 // tiny helper to timestamp without changing the imported type
 type Msg = Message & { createdAt?: string };
+// --- Phase 3 helpers ---
+
+// Safe localStorage read (handles raw or JSON'ed values)
+const readLSString = (k: string): string | null => {
+  const v = localStorage.getItem(k);
+  if (v == null) return null;
+  try { return JSON.parse(v); } catch { return v; }
+};
+
+// Build a compact query for a triple
+const buildQuery = (head: string, rel: string, tail: string) => {
+  // Keep it short & un-opinionated so CSE matches broadly
+  // Example: "Fish oil reduce cognitive decline"
+  return `${head} ${rel} ${tail}`;
+};
+
+// Call Google Programmable Search (Custom Search API)
+// Returns {count, items[]}
+const fetchCseCount = async ({
+  apiKey, cx, q
+}: { apiKey: string; cx: string; q: string }) => {
+  const url = new URL('https://www.googleapis.com/customsearch/v1');
+  url.searchParams.set('key', apiKey);
+  url.searchParams.set('cx', cx);
+  url.searchParams.set('q', q);
+  url.searchParams.set('num', '10'); // we mostly want totalResults, but keep items for later
+
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    const txt = await res.text().catch(()=>'');
+    throw new Error(`CSE error ${res.status}: ${txt}`);
+  }
+  const data = await res.json();
+  const total = Number(data?.searchInformation?.totalResults ?? 0);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return { count: isNaN(total) ? 0 : total, items };
+};
+
+// Normalize a relation label in the graph (we stored the human text in label)
+const getEdgeRelationBase = (e: any) => {
+  // If you later preserve original relation in e.data.relation, prefer that.
+  return (e.data && (e.data as any).relation) ? (e.data as any).relation : (e.label as string);
+};
 
 export function Chat({ id, initialMessages }: ChatProps) {
   const lastEntityCategoriesRef = useRef<Record<string, string>>({});
@@ -631,6 +674,93 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     if (!ENABLE_RECOMMEND) { setActiveNodeRecs([]); return; }
     if (!clickedNode) { setActiveNodeRecs([]); return; }
   }, [clickedNode]);
+  // --- Phase 3: verify edges with Google CSE and append counts ---
+  useEffect(() => {
+    if (!ENABLE_VERIFY) return;
+    if (!edges.length) return;
+
+    // keys
+    const googleKey = readLSString('serper-token');   // you’re reusing this for the Google API key
+    const cx        = readLSString('google-cx');      // saved in EmptyScreen
+    if (!googleKey || !cx) {
+      console.warn('[verify] Missing google key or cx');
+      return;
+    }
+
+    // Avoid hammering the API: only verify edges that don't already have a count
+    // We'll cache results in edge.data.verificationCount + edge.data.sources
+    const unverified = edges.filter(e => {
+      const known = (e.data && (e.data as any).verificationCount != null);
+      return !known;
+    });
+
+    if (!unverified.length) return;
+
+    // Optionally cap how many edges we verify per render to stay snappy
+    const BATCH = 6;
+    const todo = unverified.slice(0, BATCH);
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const results = await Promise.all(todo.map(async (e) => {
+          const head = String(e.source).replace(/^node-/, '');
+          const tail = String(e.target).replace(/^node-/, '');
+          const rel  = getEdgeRelationBase(e);
+
+          const q = buildQuery(head, rel, tail);
+          try {
+            const { count, items } = await fetchCseCount({ apiKey: googleKey, cx, q });
+            return { id: e.id, count, items, rel };
+          } catch (err) {
+            console.error('[verify] CSE failed for', q, err);
+            return { id: e.id, count: 0, items: [], rel };
+          }
+        }));
+
+        if (cancelled) return;
+
+        // Paint counts into the graph
+        setEdges(prev => prev.map(e => {
+          const r = results.find(x => x.id === e.id);
+          if (!r) return e;
+
+          // Label: "relation | N"
+          const baseRel = getEdgeRelationBase(e);
+          const newLabel = `${baseRel} | ${r.count}`;
+
+          // Style hint: dashed if 0 results
+          const style = { ...(e.style || {}) };
+          if (r.count === 0) {
+            style.strokeDasharray = '4 4';
+            style.opacity = 0.7;
+          } else {
+            delete (style as any).strokeDasharray;
+            style.opacity = 1;
+          }
+
+          // Persist sources so you can show them on click/hover later
+          const data = {
+            ...(e.data || {}),
+            relation: baseRel,
+            verificationCount: r.count,
+            sources: r.items?.map((it: any) => ({
+              title: it?.title,
+              link: it?.link,
+              snippet: it?.snippet
+            })) ?? []
+          };
+
+          return { ...e, label: newLabel, data, style };
+        }));
+      } catch (err) {
+        console.error('[verify] batch failed', err);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [edges, setEdges]);
 
   const StopRegenerateButton = isLoading ? (
     <Button variant="outline" onClick={() => stop()} className="relative left-[60%]">
