@@ -62,7 +62,11 @@ const getLayoutedElements = (
   direction = 'TB'
 ) => {
   const isHorizontal = direction === 'LR';
-  dagreGraph.setGraph({ rankdir: direction });
+  dagreGraph.setGraph({ rankdir: direction,
+                        ranksep: 120,   // was default — try 100–160
+                        nodesep: 80,    // was default — try 60–100
+                        edgesep: 30,
+                        });
 
   nodes.forEach(node => {
     dagreGraph.setNode(node.id, { width: nodeWidth, height: nodeHeight });
@@ -963,7 +967,14 @@ useEffect(() => {
             sources: r.sources
           };
 
-          return { ...e, label: newLabel, data, style };
+          return { ...e, 
+            label: newLabel, 
+            data, 
+            style, 
+            labelStyle: { fontSize: 10, lineHeight: '1' },
+            labelBgStyle: { fill: 'rgba(255,255,255,0.85)' },
+            labelBgPadding: [2, 3],
+            labelBgBorderRadius: 4,};
         });
 
         // ⬇️ propagate edge evidence onto nodes so CustomNode sees data.sources
