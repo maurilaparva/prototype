@@ -4,7 +4,7 @@ import { ChatPanel } from './chat-panel.tsx';
 import { useLocalStorage } from '../lib/hooks/use-local-storage.ts';
 import { toast } from 'react-hot-toast';
 import { type Message } from 'ai/react';
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo} from 'react';
 import { EmptyScreen } from './empty-screen.tsx';
 import { ChatList } from './chat-list.tsx';
 import { useNavigate, useLocation } from 'react-router-dom';
@@ -34,6 +34,22 @@ import 'reactflow/dist/style.css'
 const ENABLE_VERIFY = true;
 const ENABLE_RECOMMEND = false;
 // -----------------------------------
+// ---- Search scope (default PubMed-only top 5) ----
+type SearchScope = 'pubmed';
+const SEARCH_TOP_N = 5;
+
+// Simple positive/negative cue phrases for rule-based labeling
+const POS_CUES = [
+  'associated with a reduction',
+  'reduces', 'decreases', 'improves', 'beneficial',
+  'protective', 'lower risk', 'improved outcomes',
+  'positively associated', 'effective', 'efficacy'
+];
+const NEG_CUES = [
+  'no association', 'not associated', 'does not', 'did not',
+  'no significant', 'insignificant', 'null finding',
+  'increases', 'worsens', 'harmful', 'adverse'
+];
 
 const dagreGraph = new dagre.graphlib.Graph();
 dagreGraph.setDefaultEdgeLabel(() => ({}));
@@ -127,28 +143,126 @@ const buildQuery = (head: string, rel: string, tail: string) => {
   // Example: "Fish oil reduce cognitive decline"
   return `${head} ${rel} ${tail}`;
 };
+// --- tiny text utils ---
+const norm = (s?: string) => (s || '').toLowerCase();
+const containsAll = (text: string, parts: string[]) =>
+  parts.every(p => norm(text).includes(norm(p)));
+
+// --- (Optional) Embeddings fallback via OpenAI (small + cheap) ---
+const embedText = async (apiKey: string, text: string): Promise<number[]> => {
+  const res = await fetch('https://api.openai.com/v1/embeddings', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'text-embedding-3-small',
+      input: text.slice(0, 3500) // keep short
+    })
+  });
+  if (!res.ok) throw new Error('Embedding failed');
+  const j = await res.json();
+  return j?.data?.[0]?.embedding ?? [];
+};
+
+const cosine = (a: number[], b: number[]) => {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i];
+  }
+  return (na && nb) ? dot / (Math.sqrt(na)*Math.sqrt(nb)) : 0;
+};
+
+// Make a short "canonical relation" sentence from the triple
+const relationTemplate = (head: string, rel: string, tail: string) =>
+  `${head} ${rel} ${tail}`;
+
+// --- Rule-based first pass: Support / Refute / Neutral ---
+const ruleLabel = (text: string, head: string, rel: string, tail: string): 'support'|'refute'|'neutral' => {
+  const t = norm(text);
+  const h = norm(head), r = norm(rel), ta = norm(tail);
+
+  // Must mention head & tail at minimum
+  if (!(t.includes(h) && t.includes(ta))) return 'neutral';
+
+  // Strong negation cues override
+  if (NEG_CUES.some(c => t.includes(c))) return 'refute';
+
+  // Positive cues
+  if (POS_CUES.some(c => t.includes(c))) return 'support';
+
+  // Heuristic: if relation verb appears near both entities
+  if (t.includes(r)) return 'support';
+
+  return 'neutral';
+};
+
+// --- Optional embedding fallback to disambiguate edge cases ---
+const embeddingLabel = async (
+  apiKey: string,
+  candidate: string,
+  head: string, rel: string, tail: string
+): Promise<'support'|'refute'|'neutral'> => {
+  const queryPos = relationTemplate(head, rel, tail);
+  const queryNeg = `${head} not ${rel} ${tail}`;
+
+  const [eCand, ePos, eNeg] = await Promise.all([
+    embedText(apiKey, candidate),
+    embedText(apiKey, queryPos),
+    embedText(apiKey, queryNeg)
+  ]);
+
+  const sPos = cosine(eCand, ePos);
+  const sNeg = cosine(eCand, eNeg);
+
+  const MARGIN = 0.05; // small margin
+  if (sPos - sNeg > MARGIN) return 'support';
+  if (sNeg - sPos > MARGIN) return 'refute';
+  return 'neutral';
+};
+
+// Label a single CSE item using rules, with optional embedding fallback
+const labelItem = async (
+  item: { title?: string; snippet?: string },
+  head: string, rel: string, tail: string,
+  openaiKey?: string
+): Promise<'support'|'refute'|'neutral'> => {
+  const text = `${item.title || ''}. ${item.snippet || ''}`;
+  const rule = ruleLabel(text, head, rel, tail);
+  if (rule !== 'neutral' || !openaiKey) return rule;
+
+  try {
+    // Only embed if rules were inconclusive
+    return await embeddingLabel(openaiKey, text, head, rel, tail);
+  } catch {
+    return 'neutral';
+  }
+};
 
 // Call Google Programmable Search (Custom Search API)
 // Returns {count, items[]}
-const fetchCseCount = async ({
-  apiKey, cx, q
-}: { apiKey: string; cx: string; q: string }) => {
+// Call Google Programmable Search for *top N* PubMed hits
+// Returns { items[] } where each item has { title, link, snippet }
+const fetchCseTopN = async ({
+  apiKey, cx, q, n = SEARCH_TOP_N
+}: { apiKey: string; cx: string; q: string; n?: number }) => {
+  // PubMed-only (you can later add PMC/NIH OR-bundle if you want)
+  const scopedQ = `(${q}) site:pubmed.ncbi.nlm.nih.gov`;
+
   const url = new URL('https://www.googleapis.com/customsearch/v1');
   url.searchParams.set('key', apiKey);
   url.searchParams.set('cx', cx);
-  url.searchParams.set('q', q);
-  url.searchParams.set('num', '10'); // we mostly want totalResults, but keep items for later
+  url.searchParams.set('q', scopedQ);
+  url.searchParams.set('num', String(Math.min(Math.max(n,1),10)));
 
   const res = await fetch(url.toString());
   if (!res.ok) {
-    const txt = await res.text().catch(()=>'');
+    const txt = await res.text().catch(()=> '');
     throw new Error(`CSE error ${res.status}: ${txt}`);
   }
   const data = await res.json();
-  const total = Number(data?.searchInformation?.totalResults ?? 0);
   const items = Array.isArray(data?.items) ? data.items : [];
-  return { count: isNaN(total) ? 0 : total, items };
+  return { items };
 };
+
 
 // Normalize a relation label in the graph (we stored the human text in label)
 const getEdgeRelationBase = (e: any) => {
@@ -166,6 +280,7 @@ export function Chat({ id, initialMessages }: ChatProps) {
   const [previewToken, setPreviewToken] = useLocalStorage<string | null>('ai-token', null);
   const [serperToken, setSerperToken] = useLocalStorage<string | null>('serper-token', null);
   const [previewTokenDialog, setPreviewTokenDialog] = useState(false);
+  const [searchScope] = useLocalStorage<SearchScope>('search-scope', 'pubmed');
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -675,92 +790,108 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     if (!clickedNode) { setActiveNodeRecs([]); return; }
   }, [clickedNode]);
   // --- Phase 3: verify edges with Google CSE and append counts ---
-  useEffect(() => {
-    if (!ENABLE_VERIFY) return;
-    if (!edges.length) return;
+  // --- Phase 3: verify edges with PubMed top-5 + semantic labels ---
+useEffect(() => {
+  if (!ENABLE_VERIFY) return;
+  if (!edges.length) return;
 
-    // keys
-    const googleKey = readLSString('serper-token');   // you’re reusing this for the Google API key
-    const cx        = readLSString('google-cx');      // saved in EmptyScreen
-    if (!googleKey || !cx) {
-      console.warn('[verify] Missing google key or cx');
-      return;
+  // keys
+  const googleKey = readLSString('serper-token');   // Google CSE key
+  const cx        = readLSString('google-cx');      // your CSE id
+  if (!googleKey || !cx) {
+    console.warn('[verify] Missing google key or cx');
+    return;
+  }
+
+  // Only verify edges that don't already have a semantic tally
+  const unverified = edges.filter(e => {
+    const known = (e.data && (e.data as any).semantic);
+    return !known;
+  });
+  if (!unverified.length) return;
+
+  const BATCH = 6; // keep UI snappy
+  const todo = unverified.slice(0, BATCH);
+
+  let cancelled = false;
+
+  (async () => {
+    try {
+      const results = await Promise.all(todo.map(async (e) => {
+        const head = String(e.source).replace(/^node-/, '');
+        const tail = String(e.target).replace(/^node-/, '');
+        const rel  = getEdgeRelationBase(e);
+        const q    = buildQuery(head, rel, tail);
+
+        try {
+          // 1) PubMed-only top N via CSE
+          const { items } = await fetchCseTopN({ apiKey: googleKey!, cx, q, n: SEARCH_TOP_N });
+
+          // 2) Label each item (rules → optional embeddings)
+          const openaiKey = readLSString('ai-token') || undefined; // optional; only used if rules return 'neutral'
+          const labels = await Promise.all(
+            items.map(it => labelItem(it, head, rel, tail, openaiKey as string | undefined))
+          );
+
+          // 3) Tally
+          const support = labels.filter(x => x === 'support').length;
+          const refute  = labels.filter(x => x === 'refute').length;
+          const neutral = labels.filter(x => x === 'neutral').length;
+
+          // Keep labeled sources for tooltip
+          const sources = items.map((it, idx) => ({
+            title: it?.title,
+            link: it?.link,
+            snippet: it?.snippet,
+            label: labels[idx]
+          }));
+
+          return { id: e.id, support, refute, neutral, sources, rel };
+        } catch (err) {
+          console.error('[verify] PubMed top-N failed for', q, err);
+          return { id: e.id, support: 0, refute: 0, neutral: 0, sources: [], rel };
+        }
+      }));
+
+      if (cancelled) return;
+
+      // 4) Paint semantic tallies into the graph
+      setEdges(prev => prev.map(e => {
+        const r = results.find(x => x.id === e.id);
+        if (!r) return e;
+
+        const baseRel = getEdgeRelationBase(e);
+        const newLabel = `${baseRel} | S:${r.support} R:${r.refute} N:${r.neutral}`;
+
+        const style = { ...(e.style || {}) };
+        if (r.support === 0 && r.refute > 0 && r.neutral === 0) {
+          style.strokeDasharray = '4 4';
+          style.opacity = 0.9;
+        } else if (r.support === 0 && r.refute === 0) {
+          style.opacity = 0.6; // all neutral
+        } else {
+          delete (style as any).strokeDasharray;
+          style.opacity = 1;
+        }
+
+        const data = {
+          ...(e.data || {}),
+          relation: baseRel,
+          verificationCount: r.support, // keep a number if other code expects it
+          semantic: { support: r.support, refute: r.refute, neutral: r.neutral },
+          sources: r.sources
+        };
+
+        return { ...e, label: newLabel, data, style };
+      }));
+    } catch (err) {
+      console.error('[verify] batch failed', err);
     }
+  })();
 
-    // Avoid hammering the API: only verify edges that don't already have a count
-    // We'll cache results in edge.data.verificationCount + edge.data.sources
-    const unverified = edges.filter(e => {
-      const known = (e.data && (e.data as any).verificationCount != null);
-      return !known;
-    });
+  return () => { cancelled = true; };
+}, [edges, setEdges]);
 
-    if (!unverified.length) return;
-
-    // Optionally cap how many edges we verify per render to stay snappy
-    const BATCH = 6;
-    const todo = unverified.slice(0, BATCH);
-
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const results = await Promise.all(todo.map(async (e) => {
-          const head = String(e.source).replace(/^node-/, '');
-          const tail = String(e.target).replace(/^node-/, '');
-          const rel  = getEdgeRelationBase(e);
-
-          const q = buildQuery(head, rel, tail);
-          try {
-            const { count, items } = await fetchCseCount({ apiKey: googleKey, cx, q });
-            return { id: e.id, count, items, rel };
-          } catch (err) {
-            console.error('[verify] CSE failed for', q, err);
-            return { id: e.id, count: 0, items: [], rel };
-          }
-        }));
-
-        if (cancelled) return;
-
-        // Paint counts into the graph
-        setEdges(prev => prev.map(e => {
-          const r = results.find(x => x.id === e.id);
-          if (!r) return e;
-
-          // Label: "relation | N"
-          const baseRel = getEdgeRelationBase(e);
-          const newLabel = `${baseRel} | ${r.count}`;
-
-          // Style hint: dashed if 0 results
-          const style = { ...(e.style || {}) };
-          if (r.count === 0) {
-            style.strokeDasharray = '4 4';
-            style.opacity = 0.7;
-          } else {
-            delete (style as any).strokeDasharray;
-            style.opacity = 1;
-          }
-
-          // Persist sources so you can show them on click/hover later
-          const data = {
-            ...(e.data || {}),
-            relation: baseRel,
-            verificationCount: r.count,
-            sources: r.items?.map((it: any) => ({
-              title: it?.title,
-              link: it?.link,
-              snippet: it?.snippet
-            })) ?? []
-          };
-
-          return { ...e, label: newLabel, data, style };
-        }));
-      } catch (err) {
-        console.error('[verify] batch failed', err);
-      }
-    })();
-
-    return () => { cancelled = true; };
-  }, [edges, setEdges]);
 
   const StopRegenerateButton = isLoading ? (
     <Button variant="outline" onClick={() => stop()} className="relative left-[60%]">
