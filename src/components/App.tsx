@@ -408,6 +408,7 @@ Identified entities must have relations with other entities in the response.
 Each sentence in the response should not include more than one relation.
 When answering a question, focus on identifying and annotating only the entities and relations that are directly relevant to the user's query. Avoid including additional entities that are not closely related to the core question.
 Try to provide context in your response.
+Relations must be a single, meaningful verb that expresses a biomedical connection (e.g., "prevent", "reduce", "increase", "support", "cause", "treat", "improve", "protect"). Do not use vague or nonsensical words like "thought", "studied", or "related". Only choose from this style of clear biomedical verbs.
 
 After your response, also add the identified entities in the user question, in the format of a JSON string list;
 Please use " || " to split the two parts.

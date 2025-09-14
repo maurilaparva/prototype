@@ -3,7 +3,18 @@ const withMT = require('@material-tailwind/react/utils/withMT')
 
 module.exports = withMT({
   darkMode: ['class'],
-  content: ['src/**/*.{ts,tsx}'],
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}"
+  ],
+  safelist: [
+    // Support (green)
+    "text-emerald-700","bg-emerald-50","border-emerald-200","hover:bg-emerald-100","bg-emerald-500",
+    // Refute (red)
+    "text-rose-700","bg-rose-50","border-rose-200","hover:bg-rose-100","bg-rose-500",
+    // Neutral (gray)
+    "text-zinc-700","bg-zinc-50","border-zinc-200","hover:bg-zinc-100","bg-zinc-400",
+  ],
   theme: {
     container: {
       center: true,

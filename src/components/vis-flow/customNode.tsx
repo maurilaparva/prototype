@@ -33,6 +33,18 @@ const badgeClass = (label?: string) => {
   }
 };
 
+// Prefix marker
+const labelPrefix = (label?: string) => {
+  switch (label) {
+    case "support":
+      return "S: ";
+    case "refute":
+      return "R: ";
+    default:
+      return "N: ";
+  }
+};
+
 const CustomNode: FC<NodeProps> = ({
   sourcePosition,
   targetPosition,
@@ -77,6 +89,7 @@ const CustomNode: FC<NodeProps> = ({
             <div className="flex max-w-[210px] flex-wrap items-center gap-1.5">
               {sources.map((s, idx) => {
                 const title = s.title || `Source ${idx + 1}`;
+                const prefix = labelPrefix(s.label);
                 return s.link ? (
                   <a
                     key={idx}
@@ -89,7 +102,9 @@ const CustomNode: FC<NodeProps> = ({
                     )}`}
                   >
                     <span className={`inline-block h-2 w-2 rounded-full ${dotClass(s.label)}`} />
-                    <span className="truncate max-w-[180px]">{title}</span>
+                    <span className="truncate max-w-[180px]">
+                      {prefix}{title}
+                    </span>
                   </a>
                 ) : (
                   <span
@@ -100,7 +115,9 @@ const CustomNode: FC<NodeProps> = ({
                     )}`}
                   >
                     <span className={`inline-block h-2 w-2 rounded-full ${dotClass(s.label)}`} />
-                    <span className="truncate max-w-[180px]">{title}</span>
+                    <span className="truncate max-w-[180px]">
+                      {prefix}{title}
+                    </span>
                   </span>
                 );
               })}
