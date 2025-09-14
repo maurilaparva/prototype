@@ -302,6 +302,52 @@ export function Chat({ id, initialMessages }: ChatProps) {
   const entityPattern = /\[([^\]\|]+)(?:\|([^\]]+))?\]\(\$N(\d+)\)/g;
   // ✅ Fixed: removed the extra `)` before the final `\)`
   const relationPattern = /\[([^\]]+)\]\((\$R\d+), (.+?)\)/g;
+  // Collect top-5 deduped evidence for each node from the current edges
+  const aggregateEvidenceForNodes = (nodesArr: any[], edgesArr: any[]) => {
+    const byNode: Record<string, any[]> = {};
+
+    edgesArr.forEach(e => {
+      const rel = (e.data && e.data.relation) || e.label || '';
+      const srcs = (e.data && e.data.sources) || [];
+      const decorate = (nodeId: string, direction: 'in' | 'out') => {
+        if (!byNode[nodeId]) byNode[nodeId] = [];
+        byNode[nodeId].push(
+          ...srcs.map((s: any) => ({
+            relation: rel,
+            direction,
+            title: s?.title,
+            link: s?.link,
+            snippet: s?.snippet,
+            label: s?.label
+          }))
+        );
+      };
+      decorate(e.source, 'out');
+      decorate(e.target, 'in');
+    });
+
+    // de-dupe by link + cap at 5
+    const dedupe = (arr: any[]) => {
+      const seen = new Set<string>();
+      const out: any[] = [];
+      for (const x of arr) {
+        const key = x.link || x.title || JSON.stringify(x);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(x);
+        if (out.length >= 5) break;
+      }
+      return out;
+    };
+
+    return nodesArr.map(n => ({
+      ...n,
+      data: {
+        ...n.data,
+        sources: dedupe(byNode[n.id] || [])
+      }
+    }));
+  };
 
   const extractRelations = (text: string): {
     relations: Array<[string, string, string]>,
@@ -785,6 +831,40 @@ Use the above examples only as a guide for format and structure. Do not reuse th
   const [clickedNode, setClickedNode] = useState<any>(null);
   const [activeNodeRecs, setActiveNodeRecs] = useState<any[]>([]);
 
+  const evidenceForClickedNode = useMemo(() => {
+    if (!clickedNode) return [];
+
+    const nodeId = clickedNode.id ?? '';
+    // find incident edges
+    const incident = edges.filter(e => e.source === nodeId || e.target === nodeId);
+
+    // collect labeled sources from each edge (these were added in verification useEffect)
+    const all = incident.flatMap(e => {
+      const rel = (e.data && (e.data as any).relation) || e.label || '';
+      const sources = (e.data && (e.data as any).sources) || [];
+      // decorate each item with relation + which side of edge the node is
+      return sources.map((s: any) => ({
+        relation: rel,
+        direction: e.source === nodeId ? 'out' : 'in',
+        title: s?.title,
+        link: s?.link,
+        snippet: s?.snippet,
+        label: s?.label // 'support' | 'refute' | 'neutral'
+      }));
+    });
+
+    // de-dupe by link, keep order
+    const seen = new Set<string>();
+    const deduped = all.filter(x => {
+      if (!x.link) return true;
+      if (seen.has(x.link)) return false;
+      seen.add(x.link);
+      return true;
+    });
+
+    return deduped.slice(0, 5);
+  }, [clickedNode, edges]);
+
   useEffect(() => {
     if (!ENABLE_RECOMMEND) { setActiveNodeRecs([]); return; }
     if (!clickedNode) { setActiveNodeRecs([]); return; }
@@ -856,34 +936,42 @@ useEffect(() => {
       if (cancelled) return;
 
       // 4) Paint semantic tallies into the graph
-      setEdges(prev => prev.map(e => {
-        const r = results.find(x => x.id === e.id);
-        if (!r) return e;
+      setEdges(prev => {
+        const nextEdges = prev.map(e => {
+          const r = results.find(x => x.id === e.id);
+          if (!r) return e;
 
-        const baseRel = getEdgeRelationBase(e);
-        const newLabel = `${baseRel} | S:${r.support} R:${r.refute} N:${r.neutral}`;
+          const baseRel = getEdgeRelationBase(e);
+          const newLabel = `${baseRel} | S:${r.support} R:${r.refute} N:${r.neutral}`;
 
-        const style = { ...(e.style || {}) };
-        if (r.support === 0 && r.refute > 0 && r.neutral === 0) {
-          style.strokeDasharray = '4 4';
-          style.opacity = 0.9;
-        } else if (r.support === 0 && r.refute === 0) {
-          style.opacity = 0.6; // all neutral
-        } else {
-          delete (style as any).strokeDasharray;
-          style.opacity = 1;
-        }
+          const style = { ...(e.style || {}) };
+          if (r.support === 0 && r.refute > 0 && r.neutral === 0) {
+            style.strokeDasharray = '4 4';
+            style.opacity = 0.9;
+          } else if (r.support === 0 && r.refute === 0) {
+            style.opacity = 0.6;
+          } else {
+            delete (style as any).strokeDasharray;
+            style.opacity = 1;
+          }
 
-        const data = {
-          ...(e.data || {}),
-          relation: baseRel,
-          verificationCount: r.support, // keep a number if other code expects it
-          semantic: { support: r.support, refute: r.refute, neutral: r.neutral },
-          sources: r.sources
-        };
+          const data = {
+            ...(e.data || {}),
+            relation: baseRel,
+            verificationCount: r.support,
+            semantic: { support: r.support, refute: r.refute, neutral: r.neutral },
+            sources: r.sources
+          };
 
-        return { ...e, label: newLabel, data, style };
-      }));
+          return { ...e, label: newLabel, data, style };
+        });
+
+        // ⬇️ propagate edge evidence onto nodes so CustomNode sees data.sources
+        setNodes(oldNodes => aggregateEvidenceForNodes(oldNodes, nextEdges));
+
+        return nextEdges;
+      });
+
     } catch (err) {
       console.error('[verify] batch failed', err);
     }
@@ -969,6 +1057,8 @@ useEffect(() => {
                   id={id}
                   append={append}
                   activeStep={activeStep}
+                  clickedNode={clickedNode}
+                  evidence = {evidenceForClickedNode}
                 />
               </ReactFlowProvider>
             </div>
