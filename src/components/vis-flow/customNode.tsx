@@ -64,7 +64,7 @@ const CustomNode: FC<NodeProps> = ({
         }}
         style={{
           overflow: "hidden",
-          borderColor: "#1A192B",
+          borderColor: "#d1d5db",
           borderWidth: "1px",
           borderStyle: "solid",
           borderRadius: "5px",
