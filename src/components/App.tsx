@@ -63,8 +63,8 @@ const getLayoutedElements = (
 ) => {
   const isHorizontal = direction === 'LR';
   dagreGraph.setGraph({ rankdir: direction,
-                        ranksep: 120,   // was default — try 100–160
-                        nodesep: 80,    // was default — try 60–100
+                        ranksep: 120,
+                        nodesep: 80,
                         edgesep: 30,
                         });
 
@@ -143,8 +143,6 @@ const readLSString = (k: string): string | null => {
 
 // Build a compact query for a triple
 const buildQuery = (head: string, rel: string, tail: string) => {
-  // Keep it short & un-opinionated so CSE matches broadly
-  // Example: "Fish oil reduce cognitive decline"
   return `${head} ${rel} ${tail}`;
 };
 // --- tiny text utils ---
@@ -159,7 +157,7 @@ const embedText = async (apiKey: string, text: string): Promise<number[]> => {
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'text-embedding-3-small',
-      input: text.slice(0, 3500) // keep short
+      input: text.slice(0, 3500)
     })
   });
   if (!res.ok) throw new Error('Embedding failed');
@@ -179,7 +177,7 @@ const cosine = (a: number[], b: number[]) => {
 const relationTemplate = (head: string, rel: string, tail: string) =>
   `${head} ${rel} ${tail}`;
 
-// --- Rule-based first pass: Support / Refute / Neutral ---
+// --- Rule-based first pass: Support / Refute / Neutral (neutral will be resolved later) ---
 const ruleLabel = (text: string, head: string, rel: string, tail: string): 'support'|'refute'|'neutral' => {
   const t = norm(text);
   const h = norm(head), r = norm(rel), ta = norm(tail);
@@ -199,12 +197,12 @@ const ruleLabel = (text: string, head: string, rel: string, tail: string): 'supp
   return 'neutral';
 };
 
-// --- Optional embedding fallback to disambiguate edge cases ---
+// --- Embedding fallback: force a binary decision ---
 const embeddingLabel = async (
   apiKey: string,
   candidate: string,
   head: string, rel: string, tail: string
-): Promise<'support'|'refute'|'neutral'> => {
+): Promise<'support'|'refute'> => {
   const queryPos = relationTemplate(head, rel, tail);
   const queryNeg = `${head} not ${rel} ${tail}`;
 
@@ -217,38 +215,36 @@ const embeddingLabel = async (
   const sPos = cosine(eCand, ePos);
   const sNeg = cosine(eCand, eNeg);
 
-  const MARGIN = 0.05; // small margin
-  if (sPos - sNeg > MARGIN) return 'support';
-  if (sNeg - sPos > MARGIN) return 'refute';
-  return 'neutral';
+  // Binary decision: whichever similarity is larger wins
+  return (sPos >= sNeg) ? 'support' : 'refute';
 };
 
-// Label a single CSE item using rules, with optional embedding fallback
+// Label a single CSE item using rules, with embedding fallback (binary only)
 const labelItem = async (
   item: { title?: string; snippet?: string },
   head: string, rel: string, tail: string,
   openaiKey?: string
-): Promise<'support'|'refute'|'neutral'> => {
+): Promise<'support'|'refute'> => {
   const text = `${item.title || ''}. ${item.snippet || ''}`;
   const rule = ruleLabel(text, head, rel, tail);
-  if (rule !== 'neutral' || !openaiKey) return rule;
 
-  try {
-    // Only embed if rules were inconclusive
-    return await embeddingLabel(openaiKey, text, head, rel, tail);
-  } catch {
-    return 'neutral';
+  if (rule === 'support' || rule === 'refute') return rule;
+
+  if (openaiKey) {
+    try {
+      return await embeddingLabel(openaiKey, text, head, rel, tail);
+    } catch {
+      // fall through
+    }
   }
+  // Conservative fallback if embeddings unavailable/error
+  return 'refute';
 };
 
-// Call Google Programmable Search (Custom Search API)
-// Returns {count, items[]}
 // Call Google Programmable Search for *top N* PubMed hits
-// Returns { items[] } where each item has { title, link, snippet }
 const fetchCseTopN = async ({
   apiKey, cx, q, n = SEARCH_TOP_N
 }: { apiKey: string; cx: string; q: string; n?: number }) => {
-  // PubMed-only (you can later add PMC/NIH OR-bundle if you want)
   const scopedQ = `(${q}) site:pubmed.ncbi.nlm.nih.gov`;
 
   const url = new URL('https://www.googleapis.com/customsearch/v1');
@@ -270,7 +266,6 @@ const fetchCseTopN = async ({
 
 // Normalize a relation label in the graph (we stored the human text in label)
 const getEdgeRelationBase = (e: any) => {
-  // If you later preserve original relation in e.data.relation, prefer that.
   return (e.data && (e.data as any).relation) ? (e.data as any).relation : (e.label as string);
 };
 
@@ -477,7 +472,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     });
 
     if (!res.ok || !res.body) {
-      const txt = await res.text().catch(()=>'');
+      const txt = await res.text().catch(()=> '');
       throw new Error(txt || `OpenAI error ${res.status}`);
     }
 
@@ -843,7 +838,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     // find incident edges
     const incident = edges.filter(e => e.source === nodeId || e.target === nodeId);
 
-    // collect labeled sources from each edge (these were added in verification useEffect)
+    // collect labeled sources from each edge (added in verification useEffect)
     const all = incident.flatMap(e => {
       const rel = (e.data && (e.data as any).relation) || e.label || '';
       const sources = (e.data && (e.data as any).sources) || [];
@@ -854,7 +849,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
         title: s?.title,
         link: s?.link,
         snippet: s?.snippet,
-        label: s?.label // 'support' | 'refute' | 'neutral'
+        label: s?.label // 'support' | 'refute'
       }));
     });
 
@@ -874,8 +869,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     if (!ENABLE_RECOMMEND) { setActiveNodeRecs([]); return; }
     if (!clickedNode) { setActiveNodeRecs([]); return; }
   }, [clickedNode]);
-  // --- Phase 3: verify edges with Google CSE and append counts ---
-  // --- Phase 3: verify edges with PubMed top-5 + semantic labels ---
+  // --- Phase 3: verify edges with PubMed top-5 + semantic labels (binary) ---
 useEffect(() => {
   if (!ENABLE_VERIFY) return;
   if (!edges.length) return;
@@ -913,15 +907,14 @@ useEffect(() => {
           const { items } = await fetchCseTopN({ apiKey: googleKey!, cx, q, n: SEARCH_TOP_N });
 
           // 2) Label each item (rules → optional embeddings)
-          const openaiKey = readLSString('ai-token') || undefined; // optional; only used if rules return 'neutral'
+          const openaiKey = readLSString('ai-token') || undefined; // optional; used only if rules were inconclusive
           const labels = await Promise.all(
             items.map(it => labelItem(it, head, rel, tail, openaiKey as string | undefined))
           );
 
-          // 3) Tally
+          // 3) Tally (binary)
           const support = labels.filter(x => x === 'support').length;
           const refute  = labels.filter(x => x === 'refute').length;
-          const neutral = labels.filter(x => x === 'neutral').length;
 
           // Keep labeled sources for tooltip
           const sources = items.map((it, idx) => ({
@@ -931,10 +924,10 @@ useEffect(() => {
             label: labels[idx]
           }));
 
-          return { id: e.id, support, refute, neutral, sources, rel };
+          return { id: e.id, support, refute, sources, rel };
         } catch (err) {
           console.error('[verify] PubMed top-N failed for', q, err);
-          return { id: e.id, support: 0, refute: 0, neutral: 0, sources: [], rel };
+          return { id: e.id, support: 0, refute: 0, sources: [], rel };
         }
       }));
 
@@ -947,13 +940,14 @@ useEffect(() => {
           if (!r) return e;
 
           const baseRel = getEdgeRelationBase(e);
-          const newLabel = `${baseRel} | S:${r.support} R:${r.refute} N:${r.neutral}`;
+          const newLabel = `${baseRel} | S:${r.support} R:${r.refute}`;
 
           const style = { ...(e.style || {}) };
-          if (r.support === 0 && r.refute > 0 && r.neutral === 0) {
+          if (r.support === 0 && r.refute > 0) {
             style.strokeDasharray = '4 4';
             style.opacity = 0.9;
           } else if (r.support === 0 && r.refute === 0) {
+            // No hits at all — dim the edge slightly
             style.opacity = 0.6;
           } else {
             delete (style as any).strokeDasharray;
@@ -964,18 +958,20 @@ useEffect(() => {
             ...(e.data || {}),
             relation: baseRel,
             verificationCount: r.support,
-            semantic: { support: r.support, refute: r.refute, neutral: r.neutral },
+            semantic: { support: r.support, refute: r.refute }, // binary only
             sources: r.sources
           };
 
-          return { ...e, 
-            label: newLabel, 
-            data, 
-            style, 
+          return {
+            ...e,
+            label: newLabel,
+            data,
+            style,
             labelStyle: { fontSize: 10, lineHeight: '1' },
             labelBgStyle: { fill: 'rgba(255,255,255,0.85)' },
             labelBgPadding: [2, 3],
-            labelBgBorderRadius: 4,};
+            labelBgBorderRadius: 4,
+          };
         });
 
         // ⬇️ propagate edge evidence onto nodes so CustomNode sees data.sources
