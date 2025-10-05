@@ -79,13 +79,17 @@ const CustomEdge: FC<EdgeProps> = ({
                 ...style,
                 position: 'absolute',
                 transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
-                backgroundColor: 'white',
-                pointerEvents: 'all',
-                cursor: 'pointer',
-                borderRadius: 6,
-                padding: '2px 6px',
-                boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+                backgroundColor: 'rgba(255,255,255,0.7)',        // softer than solid white
+                backdropFilter: 'blur(6px)',
+                WebkitBackdropFilter: 'blur(6px)',               // Safari
+                border: '1px solid #e5e7eb',                     // zinc-200
+                borderRadius: 9999,                               // pill shape
+                padding: '2px 10px',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
                 fontSize: 12,
+                fontWeight: 500,
+                cursor: 'pointer',
+                pointerEvents: 'all',
                 userSelect: 'none'
               }}
               className="nodrag nopan"
@@ -95,7 +99,7 @@ const CustomEdge: FC<EdgeProps> = ({
             </div>
           </PopoverHandler>
 
-          <PopoverContent className="z-[1000] max-w-xs p-2">
+          <PopoverContent className="z-[1000] max-w-[14rem] p-2">
             {sources.length ? (
               <div className="flex flex-wrap items-center gap-1.5">
                 {sources.map((s, idx) => {
