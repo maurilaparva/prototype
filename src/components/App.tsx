@@ -157,7 +157,7 @@ const embedText = async (apiKey: string, text: string): Promise<number[]> => {
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'text-embedding-3-small',
-      input: text.slice(0, 3500)
+      input: text.slice(0, 1200) // tighter cap for cost control
     })
   });
   if (!res.ok) throw new Error('Embedding failed');
@@ -197,44 +197,103 @@ const ruleLabel = (text: string, head: string, rel: string, tail: string): 'supp
   return 'neutral';
 };
 
-// --- Embedding fallback: force a binary decision ---
-const embeddingLabel = async (
+// ---------- NEW: Abstract helpers (cheap snip) ----------
+const smartAbstract = (abs: string, head: string, rel: string, tail: string) => {
+  try {
+    const cues = [...POS_CUES, ...NEG_CUES, head.toLowerCase(), tail.toLowerCase(), rel.toLowerCase()];
+    const sents = abs.split(/(?<=[.?!])\s+/).slice(0, 8); // small window
+    const keep: number[] = [];
+    for (let i = 0; i < Math.min(2, sents.length); i++) keep.push(i); // always first 1–2
+    sents.forEach((s, i) => {
+      const t = s.toLowerCase();
+      if (cues.some(c => t.includes(c))) keep.push(i);
+    });
+    const joined = Array.from(new Set(keep)).sort((a,b)=>a-b).map(i => sents[i]).join(' ');
+    return (joined || sents.slice(0, 2).join(' ')).slice(0, 800); // hard cap
+  } catch { return abs.slice(0, 800); }
+};
+
+const extractPmidFromLink = (link?: string): string | null => {
+  if (!link) return null;
+  // pubmed.ncbi.nlm.nih.gov/PMID/...
+  const m = link.match(/pubmed\.ncbi\.nlm\.nih\.gov\/(\d+)/i);
+  return m?.[1] ?? null;
+};
+
+const fetchPubMedAbstract = async (pmid: string, timeoutMs = 3500): Promise<string | null> => {
+  // Light HTML fetch; we’ll extract abstract text via regex (best-effort)
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`https://pubmed.ncbi.nlm.nih.gov/${pmid}/?format=abstract`, { signal: controller.signal });
+    if (!res.ok) return null;
+    const html = await res.text();
+    // crude strip: inside <div class="abstract"> ... </div>
+    const block = html.match(/<div[^>]*class="abstract"[^>]*>([\s\S]*?)<\/div>/i)?.[1]
+               || html.match(/<div[^>]*id="abstract"[^>]*>([\s\S]*?)<\/div>/i)?.[1];
+    if (!block) return null;
+    const text = block
+      .replace(/<[^>]+>/g, ' ')   // strip tags
+      .replace(/\s+/g, ' ')       // collapse spaces
+      .trim();
+    return text || null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+};
+
+type CseItem = { title?: string; link?: string; snippet?: string; abstract?: string };
+
+// Enrich top-N items with short abstract snippets (best-effort, bounded)
+const enrichItemsWithAbstracts = async (
+  items: CseItem[],
+  head: string, rel: string, tail: string
+): Promise<CseItem[]> => {
+  const MAX_ENRICH = Math.min(items.length, SEARCH_TOP_N);
+  const targets = items.slice(0, MAX_ENRICH);
+  const enriched = await Promise.all(targets.map(async (it) => {
+    const pmid = extractPmidFromLink(it.link);
+    if (!pmid) return it;
+    const abs = await fetchPubMedAbstract(pmid);
+    if (!abs) return it;
+    return { ...it, abstract: smartAbstract(abs, head, rel, tail) };
+  }));
+  return enriched.concat(items.slice(MAX_ENRICH));
+};
+
+// --- Embedding fallback: force a binary decision (reusing hypotheses) ---
+const embeddingBinaryLabel = async (
   apiKey: string,
   candidate: string,
-  head: string, rel: string, tail: string
+  ePos: number[],
+  eNeg: number[]
 ): Promise<'support'|'refute'> => {
-  const queryPos = relationTemplate(head, rel, tail);
-  const queryNeg = `${head} not ${rel} ${tail}`;
-
-  const [eCand, ePos, eNeg] = await Promise.all([
-    embedText(apiKey, candidate),
-    embedText(apiKey, queryPos),
-    embedText(apiKey, queryNeg)
-  ]);
-
+  const eCand = await embedText(apiKey, candidate);
   const sPos = cosine(eCand, ePos);
   const sNeg = cosine(eCand, eNeg);
-
-  // Binary decision: whichever similarity is larger wins
   return (sPos >= sNeg) ? 'support' : 'refute';
 };
 
 // Label a single CSE item using rules, with embedding fallback (binary only)
+// Uses title + (abstract if available, else snippet) for embeddings
 const labelItem = async (
-  item: { title?: string; snippet?: string },
+  item: CseItem,
   head: string, rel: string, tail: string,
-  openaiKey?: string
+  openaiKey: string | undefined,
+  ePos?: number[], eNeg?: number[]
 ): Promise<'support'|'refute'> => {
-  const text = `${item.title || ''}. ${item.snippet || ''}`;
-  const rule = ruleLabel(text, head, rel, tail);
-
+  const ruleText = `${item.title || ''}. ${item.snippet || ''}`;
+  const rule = ruleLabel(ruleText, head, rel, tail);
   if (rule === 'support' || rule === 'refute') return rule;
 
-  if (openaiKey) {
+  if (openaiKey && ePos && eNeg) {
+    const candidate = `${item.title || ''}. ${item.abstract || item.snippet || ''}`.slice(0, 1200);
     try {
-      return await embeddingLabel(openaiKey, text, head, rel, tail);
+      return await embeddingBinaryLabel(openaiKey, candidate, ePos, eNeg);
     } catch {
-      // fall through
+      // fallthrough
     }
   }
   // Conservative fallback if embeddings unavailable/error
@@ -869,7 +928,7 @@ Use the above examples only as a guide for format and structure. Do not reuse th
     if (!ENABLE_RECOMMEND) { setActiveNodeRecs([]); return; }
     if (!clickedNode) { setActiveNodeRecs([]); return; }
   }, [clickedNode]);
-  // --- Phase 3: verify edges with PubMed top-5 + semantic labels (binary) ---
+  // --- Phase 3: verify edges with PubMed top-5 + semantic labels (binary) + abstract enrichment ---
 useEffect(() => {
   if (!ENABLE_VERIFY) return;
   if (!edges.length) return;
@@ -906,18 +965,34 @@ useEffect(() => {
           // 1) PubMed-only top N via CSE
           const { items } = await fetchCseTopN({ apiKey: googleKey!, cx, q, n: SEARCH_TOP_N });
 
-          // 2) Label each item (rules → optional embeddings)
-          const openaiKey = readLSString('ai-token') || undefined; // optional; used only if rules were inconclusive
+          // 2) (NEW) Best-effort abstract enrichment for better semantics
+          const enriched = await enrichItemsWithAbstracts(items, head, rel, tail);
+
+          // 3) Label each item (rules → optional embeddings)
+          const openaiKey = readLSString('ai-token') || undefined; // optional; only if rules inconclusive
+
+          // Precompute hypotheses ONCE per edge if we will embed
+          let ePos: number[] | undefined;
+          let eNeg: number[] | undefined;
+          if (openaiKey) {
+            const queryPos = relationTemplate(head, rel, tail);
+            const queryNeg = `${head} not ${rel} ${tail}`;
+            [ePos, eNeg] = await Promise.all([
+              embedText(openaiKey, queryPos),
+              embedText(openaiKey, queryNeg)
+            ]);
+          }
+
           const labels = await Promise.all(
-            items.map(it => labelItem(it, head, rel, tail, openaiKey as string | undefined))
+            enriched.map(it => labelItem(it, head, rel, tail, openaiKey as string | undefined, ePos, eNeg))
           );
 
-          // 3) Tally (binary)
+          // 4) Tally (binary)
           const support = labels.filter(x => x === 'support').length;
           const refute  = labels.filter(x => x === 'refute').length;
 
           // Keep labeled sources for tooltip
-          const sources = items.map((it, idx) => ({
+          const sources = enriched.map((it, idx) => ({
             title: it?.title,
             link: it?.link,
             snippet: it?.snippet,
@@ -933,7 +1008,7 @@ useEffect(() => {
 
       if (cancelled) return;
 
-      // 4) Paint semantic tallies into the graph
+      // 5) Paint semantic tallies into the graph
       setEdges(prev => {
         const nextEdges = prev.map(e => {
           const r = results.find(x => x.id === e.id);
