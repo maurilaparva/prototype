@@ -149,6 +149,23 @@ const buildQuery = (head: string, rel: string, tail: string) => {
 const norm = (s?: string) => (s || '').toLowerCase();
 const containsAll = (text: string, parts: string[]) =>
   parts.every(p => norm(text).includes(norm(p)));
+// --- Add this helper (near embeddings) ---
+const marginToProb = (m: number, alpha = 4) => 1 / (1 + Math.exp(-alpha * m)); // m = sPos - sNeg
+
+const embeddingBinaryScore = async (
+  apiKey: string,
+  candidate: string,
+  ePos: number[],
+  eNeg: number[]
+): Promise<{ label: 'support' | 'refute'; p: number }> => {
+  const eCand = await embedText(apiKey, candidate);
+  const sPos = cosine(eCand, ePos);
+  const sNeg = cosine(eCand, eNeg);
+  const probSupport = marginToProb(sPos - sNeg); // 0..1
+  const label = probSupport >= 0.5 ? 'support' : 'refute';
+  const p = label === 'support' ? probSupport : (1 - probSupport);
+  return { label, p };
+};
 
 // --- (Optional) Embeddings fallback via OpenAI (small + cheap) ---
 const embedText = async (apiKey: string, text: string): Promise<number[]> => {
@@ -278,27 +295,40 @@ const embeddingBinaryLabel = async (
 
 // Label a single CSE item using rules, with embedding fallback (binary only)
 // Uses title + (abstract if available, else snippet) for embeddings
+// Change return type and logic
 const labelItem = async (
   item: CseItem,
-  head: string, rel: string, tail: string,
+  head: string,
+  rel: string,
+  tail: string,
   openaiKey: string | undefined,
-  ePos?: number[], eNeg?: number[]
-): Promise<'support'|'refute'> => {
-  const ruleText = `${item.title || ''}. ${item.snippet || ''}`;
-  const rule = ruleLabel(ruleText, head, rel, tail);
-  if (rule === 'support' || rule === 'refute') return rule;
-
-  if (openaiKey && ePos && eNeg) {
-    const candidate = `${item.title || ''}. ${item.abstract || item.snippet || ''}`.slice(0, 1200);
-    try {
-      return await embeddingBinaryLabel(openaiKey, candidate, ePos, eNeg);
-    } catch {
-      // fallthrough
-    }
+  ePos?: number[],
+  eNeg?: number[]
+): Promise<{ label: 'support' | 'refute'; p?: number }> => {
+  if (!openaiKey || !ePos || !eNeg) {
+    // cannot embed → neutral fallback
+    return { label: 'refute', p: 0.5 };
   }
-  // Conservative fallback if embeddings unavailable/error
-  return 'refute';
+
+  try {
+    // Combine title + abstract/snippet as candidate text
+    const candidate = `${item.title || ''}. ${item.abstract || item.snippet || ''}`.slice(0, 1200);
+    const eCand = await embedText(openaiKey, candidate);
+
+    const sPos = cosine(eCand, ePos);
+    const sNeg = cosine(eCand, eNeg);
+
+    // Normalize similarity → probability-like score
+    const p = 1 / (1 + Math.exp(-(sPos - sNeg) * 8)); // sharpen sigmoid
+    const label = p >= 0.5 ? 'support' : 'refute';
+    return { label, p: Math.round(p * 100) }; // percent format
+  } catch (err) {
+    console.error('[labelItem] embedding failed:', err);
+    return { label: 'refute', p: 50 };
+  }
 };
+
+
 
 // Call Google Programmable Search for *top N* PubMed hits
 const fetchCseTopN = async ({
@@ -983,21 +1013,24 @@ useEffect(() => {
             ]);
           }
 
+          // labels now: Array<{label, p?}>
           const labels = await Promise.all(
             enriched.map(it => labelItem(it, head, rel, tail, openaiKey as string | undefined, ePos, eNeg))
           );
 
-          // 4) Tally (binary)
-          const support = labels.filter(x => x === 'support').length;
-          const refute  = labels.filter(x => x === 'refute').length;
+          // Tally with labels[i].label
+          const support = labels.filter(x => x.label === 'support').length;
+          const refute  = labels.filter(x => x.label === 'refute').length;
 
-          // Keep labeled sources for tooltip
+          // Attach per-source p
           const sources = enriched.map((it, idx) => ({
             title: it?.title,
             link: it?.link,
             snippet: it?.snippet,
-            label: labels[idx]
+            label: labels[idx].label,   // 'support' | 'refute'
+            p: labels[idx].p            // number | undefined
           }));
+
 
           return { id: e.id, support, refute, sources, rel };
         } catch (err) {

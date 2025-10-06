@@ -11,6 +11,7 @@ type EvidenceItem = {
   label?: "support" | "refute" | "neutral";
   relation?: string;
   direction?: "in" | "out";
+  p?: number; // ← per-source probability (0..1), if available
 };
 
 const dotClass = (label?: string) => {
@@ -138,11 +139,17 @@ const CustomEdge: FC<EdgeProps> = ({
             </div>
           </PopoverHandler>
 
-          <PopoverContent className="z-[1000] max-w-[14rem] p-2">
+          <PopoverContent className="z-[1000] max-w-[17rem] p-2">
             {sources.length ? (
               <div className="flex flex-wrap items-center gap-1.5">
                 {sources.map((s, idx) => {
                   const title = s.title || `Source ${idx + 1}`;
+                  const pct = typeof s.p === "number" ? Math.round(s.p * 100) : null;
+
+                  const rightBits = pct !== null ? (
+                    <span className="ml-1 text-[10px] text-zinc-500">{pct}%</span>
+                  ) : null;
+
                   return s.link ? (
                     <a
                       key={idx}
@@ -155,6 +162,7 @@ const CustomEdge: FC<EdgeProps> = ({
                       <span className={`inline-block h-2 w-2 rounded-full ${dotClass(s.label)}`} />
                       <Prefix label={s.label as any} />
                       <span className="truncate max-w-[180px]">{title}</span>
+                      {rightBits}
                     </a>
                   ) : (
                     <span
@@ -165,6 +173,7 @@ const CustomEdge: FC<EdgeProps> = ({
                       <span className={`inline-block h-2 w-2 rounded-full ${dotClass(s.label)}`} />
                       <Prefix label={s.label as any} />
                       <span className="truncate max-w-[180px]">{title}</span>
+                      {rightBits}
                     </span>
                   );
                 })}
