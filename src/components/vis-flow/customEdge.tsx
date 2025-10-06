@@ -28,10 +28,10 @@ const badgeClass = (label?: string) => {
   }
 };
 
-// colored S/R element (green for S, red for R)
+// Colored S/R prefix to match edge palette (teal/amber)
 const Prefix = ({ label }: { label?: "support" | "refute" | "neutral" }) => {
-  if (label === "support") return <span className="font-semibold text-emerald-600">S:&nbsp;</span>;
-  if (label === "refute")  return <span className="font-semibold text-rose-600">R:&nbsp;</span>;
+  if (label === "support") return <span className="font-semibold text-teal-600">S:&nbsp;</span>;
+  if (label === "refute")  return <span className="font-semibold text-amber-600">R:&nbsp;</span>;
   return <span className="font-semibold text-zinc-500">N:&nbsp;</span>;
 };
 
@@ -43,13 +43,12 @@ const CustomEdge: FC<EdgeProps> = ({
     sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition
   });
 
-  // Read tallies from your verify step
+  // Tallies from your verify step
   const { S, R } = useMemo(() => {
     const sem = (data as any)?.semantic || {};
     let support = sem.support ?? 0;
     let refute  = sem.refute  ?? 0;
 
-    // fallback to counting source labels if needed
     if ((support + refute) === 0 && Array.isArray((data as any)?.sources)) {
       const arr: EvidenceItem[] = (data as any).sources;
       support = arr.filter(s => s.label === "support").length;
@@ -58,16 +57,32 @@ const CustomEdge: FC<EdgeProps> = ({
     return { S: support, R: refute };
   }, [data]);
 
-  // Winner → style
+  // Binary winner
   const winner: "support" | "refute" = S >= R ? "support" : "refute";
-  const strokeColor = winner === "support" ? "#34D399" /* emerald-400 */ : "#F87171" /* rose-400 */;
-  const dash = winner === "refute" ? "6 4" : undefined; // dashed only for refute (no dotting on support)
-
-  // Subtle width/opacity scaling by confidence (tweak if you want more contrast)
   const total = S + R;
   const conf = total > 0 ? Math.max(S, R) / total : 0.5;
-  const strokeWidth = 1.5 + conf * 1.5;   // 1.5 → 3.0
-  const baseOpacity = 0.45 + conf * 0.5;  // 0.45 → 0.95
+
+  // --- TWO VISUAL MODES ---
+  const mode: "patternColor" | "iconOnly" = (data as any)?.styleMode ?? "patternColor";
+
+  // Mode 1: muted color + pattern
+  const color_support = "#14b8a6"; // teal-500
+  const color_refute  = "#f59e0b"; // amber-500
+  // Mode 4: neutral edge (slate)
+  const color_neutral = "#94a3b8"; // slate-400
+
+  // Stroke config per mode
+  const strokeColor =
+    mode === "patternColor"
+      ? (winner === "support" ? color_support : color_refute)
+      : color_neutral;
+
+  // pattern: solid for support, dashed for refute (both modes)
+  const dash = winner === "refute" ? "6 4" : undefined;
+
+  // Subtle width/opacity scaling by confidence
+  const strokeWidth = 1.6 + conf * 1.4;   // ~1.6 → 3.0
+  const baseOpacity = 0.45 + conf * 0.5;  // ~0.45 → 0.95
 
   const [revealed, setRevealed] = useState(false);
   const edgeDelay = typeof (data as any)?.delay === 'number' ? (data as any).delay : 0.12;
@@ -94,7 +109,7 @@ const CustomEdge: FC<EdgeProps> = ({
         onAnimationComplete={() => setRevealed(true)}
       />
 
-      {/* Label pill over the edge */}
+      {/* Label pill over the edge (unchanged tooltip behavior) */}
       <EdgeLabelRenderer>
         <Popover placement="top">
           <PopoverHandler>
@@ -106,10 +121,9 @@ const CustomEdge: FC<EdgeProps> = ({
                 backgroundColor: 'rgba(255,255,255,0.7)',
                 backdropFilter: 'blur(6px)',
                 WebkitBackdropFilter: 'blur(6px)',
-                border: '1px solid #e5e7eb', // zinc-200
-                borderRadius: 9999,          // pill
+                border: '1px solid #e5e7eb',
+                borderRadius: 9999,
                 padding: '2px 10px',
-                // removed the inset colored glow that caused the tiny left "stick out"
                 boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
                 fontSize: 12,
                 fontWeight: 500,
