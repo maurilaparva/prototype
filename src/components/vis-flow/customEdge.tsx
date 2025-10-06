@@ -1,5 +1,5 @@
 import { EdgeLabelRenderer, EdgeProps } from "reactflow";
-import { FC, useState } from "react";
+import { FC, useState, useMemo } from "react";
 import { getBezierPath } from "reactflow";
 import { Popover, PopoverHandler, PopoverContent } from "@material-tailwind/react";
 import { motion } from "framer-motion";
@@ -27,7 +27,13 @@ const badgeClass = (label?: string) => {
     default:        return "border-zinc-200 bg-zinc-50 text-zinc-700 hover:bg-zinc-100";
   }
 };
-const labelPrefix = (label?: string) => (label === "support" ? "S: " : label === "refute" ? "R: " : "N: ");
+
+// colored S/R element (green for S, red for R)
+const Prefix = ({ label }: { label?: "support" | "refute" | "neutral" }) => {
+  if (label === "support") return <span className="font-semibold text-emerald-600">S:&nbsp;</span>;
+  if (label === "refute")  return <span className="font-semibold text-rose-600">R:&nbsp;</span>;
+  return <span className="font-semibold text-zinc-500">N:&nbsp;</span>;
+};
 
 const CustomEdge: FC<EdgeProps> = ({
   sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition,
@@ -37,13 +43,31 @@ const CustomEdge: FC<EdgeProps> = ({
     sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition
   });
 
-  const status = (data as any)?.verification?.status;
-  const finalDash =
-    status === "missing" ? "2 4" :
-    status === "weak"    ? "6 4" :
-    undefined;
-  const finalWidth =
-    status === "verified" || status === "supported" ? 2.5 : 2;
+  // Read tallies from your verify step
+  const { S, R } = useMemo(() => {
+    const sem = (data as any)?.semantic || {};
+    let support = sem.support ?? 0;
+    let refute  = sem.refute  ?? 0;
+
+    // fallback to counting source labels if needed
+    if ((support + refute) === 0 && Array.isArray((data as any)?.sources)) {
+      const arr: EvidenceItem[] = (data as any).sources;
+      support = arr.filter(s => s.label === "support").length;
+      refute  = arr.filter(s => s.label === "refute").length;
+    }
+    return { S: support, R: refute };
+  }, [data]);
+
+  // Winner → style
+  const winner: "support" | "refute" = S >= R ? "support" : "refute";
+  const strokeColor = winner === "support" ? "#34D399" /* emerald-400 */ : "#F87171" /* rose-400 */;
+  const dash = winner === "refute" ? "6 4" : undefined; // dashed only for refute (no dotting on support)
+
+  // Subtle width/opacity scaling by confidence (tweak if you want more contrast)
+  const total = S + R;
+  const conf = total > 0 ? Math.max(S, R) / total : 0.5;
+  const strokeWidth = 1.5 + conf * 1.5;   // 1.5 → 3.0
+  const baseOpacity = 0.45 + conf * 0.5;  // 0.45 → 0.95
 
   const [revealed, setRevealed] = useState(false);
   const edgeDelay = typeof (data as any)?.delay === 'number' ? (data as any).delay : 0.12;
@@ -60,17 +84,17 @@ const CustomEdge: FC<EdgeProps> = ({
         d={edgePath}
         fill="none"
         strokeLinecap="butt"
-        stroke="#000"
-        strokeWidth={finalWidth}
-        strokeDasharray={revealed ? finalDash : undefined}
+        stroke={strokeColor}
+        strokeWidth={strokeWidth}
+        strokeDasharray={revealed ? dash : undefined}
         markerEnd={markerEnd as any}
-        initial={{ pathLength: 0, opacity: 0.95 }}
-        animate={{ pathLength: 1, opacity: 1 }}
+        initial={{ pathLength: 0, opacity: 0.9 }}
+        animate={{ pathLength: 1, opacity: baseOpacity }}
         transition={{ duration: 0.70, ease: "easeInOut", delay: edgeDelay }}
         onAnimationComplete={() => setRevealed(true)}
       />
 
-      {/* Clickable label + evidence popover */}
+      {/* Label pill over the edge */}
       <EdgeLabelRenderer>
         <Popover placement="top">
           <PopoverHandler>
@@ -79,12 +103,13 @@ const CustomEdge: FC<EdgeProps> = ({
                 ...style,
                 position: 'absolute',
                 transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
-                backgroundColor: 'rgba(255,255,255,0.7)',        // softer than solid white
+                backgroundColor: 'rgba(255,255,255,0.7)',
                 backdropFilter: 'blur(6px)',
-                WebkitBackdropFilter: 'blur(6px)',               // Safari
-                border: '1px solid #e5e7eb',                     // zinc-200
-                borderRadius: 9999,                               // pill shape
+                WebkitBackdropFilter: 'blur(6px)',
+                border: '1px solid #e5e7eb', // zinc-200
+                borderRadius: 9999,          // pill
                 padding: '2px 10px',
+                // removed the inset colored glow that caused the tiny left "stick out"
                 boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
                 fontSize: 12,
                 fontWeight: 500,
@@ -104,7 +129,6 @@ const CustomEdge: FC<EdgeProps> = ({
               <div className="flex flex-wrap items-center gap-1.5">
                 {sources.map((s, idx) => {
                   const title = s.title || `Source ${idx + 1}`;
-                  const prefix = labelPrefix(s.label);
                   return s.link ? (
                     <a
                       key={idx}
@@ -115,7 +139,8 @@ const CustomEdge: FC<EdgeProps> = ({
                       className={`group inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs leading-none transition ${badgeClass(s.label)}`}
                     >
                       <span className={`inline-block h-2 w-2 rounded-full ${dotClass(s.label)}`} />
-                      <span className="truncate max-w-[180px]">{prefix}{title}</span>
+                      <Prefix label={s.label as any} />
+                      <span className="truncate max-w-[180px]">{title}</span>
                     </a>
                   ) : (
                     <span
@@ -124,7 +149,8 @@ const CustomEdge: FC<EdgeProps> = ({
                       className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs leading-none ${badgeClass(s.label)}`}
                     >
                       <span className={`inline-block h-2 w-2 rounded-full ${dotClass(s.label)}`} />
-                      <span className="truncate max-w-[180px]">{prefix}{title}</span>
+                      <Prefix label={s.label as any} />
+                      <span className="truncate max-w-[180px]">{title}</span>
                     </span>
                   );
                 })}
