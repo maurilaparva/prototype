@@ -144,7 +144,7 @@ const CustomEdge: FC<EdgeProps> = ({
               <div className="flex flex-wrap items-center gap-1.5">
                 {sources.map((s, idx) => {
                   const title = s.title || `Source ${idx + 1}`;
-                  const pct = typeof s.p === "number" ? Math.round(s.p * 100) : null;
+                  const pct = typeof s.p === "number" ? Math.round(s.p) : null;
 
                   const rightBits = pct !== null ? (
                     <span className="ml-1 text-[10px] text-zinc-500">{pct}%</span>
